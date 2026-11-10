@@ -1,0 +1,51 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to BTicino Door Entry",
+        "description": "Enter the credentials used by the official Door Entry app.",
+        "data": {"username": "Email", "password": "Password"}
+      },
+      "home": {
+        "title": "Select installation",
+        "data": {"home_id": "Installation"}
+      },
+      "locks": {
+        "title": "Select connected door releases",
+        "description": "Select every physical lock that is still connected to this installation.",
+        "data": {"lock_ids": "Door releases"}
+      },
+      "reauth_confirm": {
+        "title": "Reconnect BTicino Door Entry",
+        "description": "Enter the current Door Entry account password.",
+        "data": {"password": "Password"}
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach Door Entry authentication (not necessarily wrong password). Check the Home Assistant log for BTicino auth failure reason_code.",
+      "invalid_auth": "Invalid credentials",
+      "select_lock": "Select at least one connected door release",
+      "installation_data_invalid": "Cannot load modules for that installation (HTTP {http_status}, {reason_code}, body {body_kind}). Pick another installation — credentials stay; check the HA log for BTicino API failure.",
+      "unsupported_installation": "No compatible gateway and door lock on that installation. Pick another from the list (no re-login)."
+    },
+    "abort": {
+      "already_configured": "This account is already configured",
+      "cannot_connect": "Cannot load the installation",
+      "installation_data_invalid": "Cannot load installation modules (HTTP {http_status}, {reason_code}, body {body_kind}). Check Home Assistant log for BTicino API failure.",
+      "no_homes": "No Door Entry installation was found",
+      "reauth_successful": "Authentication was updated",
+      "unsupported_installation": "No compatible gateway and door lock were found"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Connected door releases",
+        "description": "Keep all physical locks that are still connected and deselect stale outputs.",
+        "data": {"lock_ids": "Door releases"}
+      }
+    },
+    "error": {"select_lock": "Select at least one connected door release"},
+    "abort": {"cannot_connect": "Cannot load door releases from Legrand"}
+  }
+}
