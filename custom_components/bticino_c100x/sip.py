@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import secrets
 import ssl
 from collections.abc import Awaitable, Callable
@@ -22,9 +23,15 @@ from .const import (
 )
 from .models import SipAccount
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class SipError(Exception):
     """SIP operation failed."""
+
+
+class SipRegistrationTimeout(SipError):
+    """REGISTER refresh got no reply; the TLS link should be reconnected now."""
 
 
 @dataclass(slots=True)
@@ -200,6 +207,10 @@ class SipClient:
         self._send_lock = asyncio.Lock()
         self._last_transaction: dict[str, Any] | None = None
         self._dialog: SipDialog | None = None
+        # RFC 3261 §10.2.4: refreshes reuse Call-ID + From-tag; only CSeq grows.
+        self._reg_call_id: str | None = None
+        self._reg_from_tag: str | None = None
+        self._reg_cseq = 0
         self.registered = False
 
     async def connect(self) -> None:
@@ -256,7 +267,21 @@ class SipClient:
 
     async def register(self) -> None:
         uri = f"sip:{self.account.domain}"
-        response = await self._authenticated_request("REGISTER", uri, b"", register=True)
+        if self._reg_call_id is None:
+            self._reg_call_id = secrets.token_hex(12)
+            self._reg_from_tag = secrets.token_hex(8)
+            self._reg_cseq = 0
+        self._reg_cseq += 1
+        transaction: dict[str, Any] = {
+            "call_id": self._reg_call_id,
+            "tag": self._reg_from_tag,
+            "sequence": self._reg_cseq,
+        }
+        response = await self._authenticated_request(
+            "REGISTER", uri, b"", register=True, transaction=transaction
+        )
+        # Auth challenge retries bump CSeq inside the same registration attempt.
+        self._reg_cseq = int(transaction["sequence"])
         if response.status_code != 200:
             raise SipError(f"SIP registration failed with status {response.status_code}")
         self.registered = True
@@ -264,7 +289,15 @@ class SipClient:
     async def _refresh_registration(self) -> None:
         while True:
             await asyncio.sleep(SIP_REREGISTER_SECONDS)
-            await self.register()
+            try:
+                await self.register()
+            except TimeoutError as err:
+                _LOGGER.warning(
+                    "BTicino SIP registration refresh timed out; reconnecting"
+                )
+                raise SipRegistrationTimeout(
+                    "SIP registration refresh timed out"
+                ) from err
 
     async def release_door(self, lock_id: str, gateway_id: str) -> None:
         """Release a Classe 100X strike using its topology module ID."""
@@ -288,7 +321,12 @@ class SipClient:
             else f"{gateway_id}.bs.iotleg.com"
         )
         uri = f"sip:c100x@{gateway_domain}"
-        response = await self._authenticated_request("MESSAGE", uri, body)
+        try:
+            response = await self._authenticated_request("MESSAGE", uri, body)
+        except TimeoutError:
+            _LOGGER.warning("BTicino door release: no response")
+            raise
+        _LOGGER.info("BTicino door release: %s", response.status_code)
         if response.status_code != 200:
             raise SipError(f"Door release failed with SIP status {response.status_code}")
 
@@ -389,45 +427,52 @@ class SipClient:
         body: bytes,
         register: bool = False,
         *,
+        transaction: dict[str, Any] | None = None,
         content_type: str = "text/plain",
         extra_headers: tuple[str, ...] = (),
     ) -> SipMessage:
-        async with self._send_lock:
-            transaction: dict[str, Any] = {}
-            first = await self._request(
-                method,
-                uri,
-                body,
-                register=register,
-                transaction=transaction,
-                content_type=content_type,
-                extra_headers=extra_headers,
-            )
-            if method == "INVITE" and first.status_code and first.status_code >= 300:
-                await self._send_failure_ack(uri, transaction, first)
-            if first.status_code not in (401, 407):
-                self._last_transaction = transaction
-                return first
-            header_name = "www-authenticate" if first.status_code == 401 else "proxy-authenticate"
-            challenge_value = first.headers.get(header_name)
-            if not challenge_value:
-                raise SipError("SIP authentication challenge was incomplete")
-            challenge = parse_digest_challenge(challenge_value)
-            authorization = digest_authorization(account=self.account, method=method, uri=uri, challenge=challenge)
-            response = await self._request(
-                method,
-                uri,
-                body,
-                register=register,
-                transaction=transaction,
-                content_type=content_type,
-                extra_headers=extra_headers,
-                authorization=("Authorization" if first.status_code == 401 else "Proxy-Authorization", authorization),
-            )
-            if method == "INVITE" and response.status_code and response.status_code >= 300:
-                await self._send_failure_ack(uri, transaction, response)
+        # Do not hold the send lock across the response wait: a REGISTER refresh
+        # must not block an unrelated door-release MESSAGE for up to 20 s.
+        transaction = transaction if transaction is not None else {}
+        first = await self._request(
+            method,
+            uri,
+            body,
+            register=register,
+            transaction=transaction,
+            content_type=content_type,
+            extra_headers=extra_headers,
+        )
+        if method == "INVITE" and first.status_code and first.status_code >= 300:
+            await self._send_failure_ack(uri, transaction, first)
+        if first.status_code not in (401, 407):
             self._last_transaction = transaction
-            return response
+            return first
+        header_name = "www-authenticate" if first.status_code == 401 else "proxy-authenticate"
+        challenge_value = first.headers.get(header_name)
+        if not challenge_value:
+            raise SipError("SIP authentication challenge was incomplete")
+        challenge = parse_digest_challenge(challenge_value)
+        authorization = digest_authorization(
+            account=self.account, method=method, uri=uri, challenge=challenge
+        )
+        response = await self._request(
+            method,
+            uri,
+            body,
+            register=register,
+            transaction=transaction,
+            content_type=content_type,
+            extra_headers=extra_headers,
+            authorization=(
+                "Authorization" if first.status_code == 401 else "Proxy-Authorization",
+                authorization,
+            ),
+        )
+        if method == "INVITE" and response.status_code and response.status_code >= 300:
+            await self._send_failure_ack(uri, transaction, response)
+        self._last_transaction = transaction
+        return response
 
     async def _send_failure_ack(
         self, uri: str, transaction: dict[str, Any], response: SipMessage
@@ -511,11 +556,12 @@ class SipClient:
         raw = f"{method} {uri} SIP/2.0\r\n" + "\r\n".join(headers) + "\r\n\r\n"
         future = asyncio.get_running_loop().create_future()
         self._pending[(call_id, cseq)] = future
-        if not self._writer:
-            raise SipError("SIP connection is not open")
-        self._writer.write(raw.encode() + body)
-        await self._writer.drain()
         try:
+            async with self._send_lock:
+                if not self._writer:
+                    raise SipError("SIP connection is not open")
+                self._writer.write(raw.encode() + body)
+                await self._writer.drain()
             return await asyncio.wait_for(future, timeout=20)
         finally:
             self._pending.pop((call_id, cseq), None)

@@ -32,11 +32,21 @@ from .const import (
 from .media_runtime import MediaRuntime, MediaRuntimeError, safe_error_code_for_exception
 from .media_session import MediaSession
 from .models import SipAccount
-from .sip import SipClient, SipError
+from .sip import SipClient, SipError, SipRegistrationTimeout
 from .topology import visible_external_units, visible_lock_modules
 from .uplink import MicrophoneUplink
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _is_sip_link_drop(error: BaseException) -> bool:
+    """True when a door release failed because the SIP TLS link went away."""
+    if isinstance(error, SipRegistrationTimeout):
+        return True
+    if isinstance(error, SipError):
+        text = str(error).casefold()
+        return "connection closed" in text or "connection is not open" in text
+    return False
 
 
 class C100XManager:
@@ -128,9 +138,29 @@ class C100XManager:
         self.registered = False
 
     async def async_release(self, lock_id: str) -> None:
+        gateway_id = self.entry.data[CONF_GATEWAY_ID]
+        try:
+            await self._async_release_once(lock_id, gateway_id)
+        except Exception as err:
+            if not _is_sip_link_drop(err):
+                raise
+            # Link dropped under a user-requested release: wait for the new SIP
+            # session and retry that same press exactly once — never invent one.
+            await self._async_wait_until_registered()
+            await self._async_release_once(lock_id, gateway_id)
+
+    async def _async_release_once(self, lock_id: str, gateway_id: str) -> None:
         if not self._sip or not self.registered:
             raise SipError("Door release is unavailable while SIP is disconnected")
-        await self._sip.release_door(lock_id, self.entry.data[CONF_GATEWAY_ID])
+        await self._sip.release_door(lock_id, gateway_id)
+
+    async def _async_wait_until_registered(self, timeout: float = 60.0) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if self._sip is not None and self.registered:
+                return
+            await asyncio.sleep(0.05)
+        raise SipError("Door release is unavailable while SIP is disconnected")
 
     async def async_start_monitoring(self, camera_id: str) -> None:
         if not self.media_session:
@@ -272,6 +302,7 @@ class C100XManager:
 
     async def _supervise(self, account: SipAccount) -> None:
         while True:
+            reconnect_immediately = False
             try:
                 assert self._sip is not None
                 await self._sip.wait_closed()
@@ -280,6 +311,8 @@ class C100XManager:
                 raise
             except Exception as err:
                 self.last_error = type(err).__name__
+                # Refresh timeout already spent ~20 s waiting; skip reconnect backoff.
+                reconnect_immediately = isinstance(err, SipRegistrationTimeout)
             self.registered = False
             self._notify()
             if self.microphone_uplink:
@@ -298,7 +331,8 @@ class C100XManager:
                 with contextlib.suppress(Exception):
                     await self._sip.close()
                 self._sip = None
-            await asyncio.sleep(SIP_RECONNECT_SECONDS)
+            if not reconnect_immediately:
+                await asyncio.sleep(SIP_RECONNECT_SECONDS)
             try:
                 await self._connect(account)
             except asyncio.CancelledError:

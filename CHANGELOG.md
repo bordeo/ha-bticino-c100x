@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 — 2026-11-10
+
+### SIP registration refresh
+
+- **Reuse Call-ID and From-tag on REGISTER refresh** (RFC 3261 §10.2.4), only
+  incrementing CSeq. Previously every 480 s refresh minted a new Call-ID/tag, which
+  matched production drops about every 500 s when the cloud ignored the refresh.
+- **Refresh timeout reconnects immediately** at warning level (no 10 s backoff).
+- **Door release no longer waits behind a pending refresh** — the send lock covers
+  the write only, not the response wait.
+- **If the SIP link drops during a user-requested release**, retry that same release
+  exactly once on the new connection. Log the cloud response code or `no response`.
+
 ## 0.3.0 — 2026-11-10
 
 Community continuation of `alpichlabs/ha-bticino-c100x` `0.2.0-beta.28` (original
