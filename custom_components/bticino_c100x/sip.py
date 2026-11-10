@@ -22,6 +22,7 @@ from .const import (
     SIP_KEEPALIVE_TIMEOUT_SECONDS,
     SIP_PORT,
     SIP_REGISTER_EXPIRES,
+    SIP_REGISTER_TIMEOUT_SECONDS,
     SIP_REREGISTER_SECONDS,
     SIP_SERVER,
     SIP_USER_AGENT,
@@ -37,10 +38,6 @@ class SipError(Exception):
 
 class SipRegistrationTimeout(SipError):
     """REGISTER refresh got no reply; the TLS link should be reconnected now."""
-
-
-class SipKeepaliveTimeout(SipError):
-    """CRLF keepalive got no pong; the TLS flow is dead and must reconnect."""
 
 
 @dataclass(slots=True)
@@ -316,7 +313,11 @@ class SipClient:
         self._pending.clear()
 
     async def wait_closed(self) -> None:
-        """Wait until the remote connection ends or a keepalive/refresh fails."""
+        """Wait until the remote connection ends or a refresh/write fails.
+
+        Keepalive stays in the wait set so a write/socket error on ping still
+        reconnects, but a missing CRLF pong is swallowed inside the loop.
+        """
         tasks = {
             task
             for task in (self._read_task, self._registration_task, self._keepalive_task)
@@ -340,7 +341,12 @@ class SipClient:
             "sequence": self._reg_cseq,
         }
         response = await self._authenticated_request(
-            "REGISTER", uri, b"", register=True, transaction=transaction
+            "REGISTER",
+            uri,
+            b"",
+            register=True,
+            transaction=transaction,
+            timeout=SIP_REGISTER_TIMEOUT_SECONDS,
         )
         # Auth challenge retries bump CSeq inside the same registration attempt.
         self._reg_cseq = int(transaction["sequence"])
@@ -360,28 +366,39 @@ class SipClient:
                 raise SipRegistrationTimeout(
                     "SIP registration refresh timed out"
                 ) from err
+            except SipError as err:
+                _LOGGER.warning(
+                    "BTicino SIP registration refresh failed (%s); reconnecting",
+                    err,
+                )
+                raise SipRegistrationTimeout(
+                    f"SIP registration refresh failed: {err}"
+                ) from err
 
     async def _keepalive_loop(self) -> None:
-        """Send RFC 5626 CRLFCRLF every 30 s; require a CRLF pong within ~10 s."""
+        """Send RFC 5626 CRLFCRLF every 30 s to keep the LB flow alive.
+
+        A missing CRLF pong is expected on Legrand/Azure and must not reconnect.
+        Write/socket failures still propagate so the supervisor can reconnect.
+        """
         while True:
             await asyncio.sleep(SIP_KEEPALIVE_SECONDS)
             if not self.registered or not self._writer:
                 continue
             self._pong_event.clear()
+            async with self._send_lock:
+                if not self._writer:
+                    raise SipError("SIP connection is not open")
+                self._writer.write(SIP_KEEPALIVE_PING)
+                await self._writer.drain()
             try:
-                async with self._send_lock:
-                    if not self._writer:
-                        raise SipError("SIP connection is not open")
-                    self._writer.write(SIP_KEEPALIVE_PING)
-                    await self._writer.drain()
                 await asyncio.wait_for(
                     self._pong_event.wait(), timeout=SIP_KEEPALIVE_TIMEOUT_SECONDS
                 )
-            except TimeoutError as err:
-                _LOGGER.warning(
-                    "BTicino SIP keepalive pong timed out; reconnecting"
+            except TimeoutError:
+                _LOGGER.debug(
+                    "BTicino SIP keepalive pong timed out (ignored; REGISTER is health check)"
                 )
-                raise SipKeepaliveTimeout("SIP keepalive pong timed out") from err
 
     async def _reply_server_ping(self) -> None:
         """Answer a server CRLFCRLF ping with a single CRLF pong."""
@@ -522,6 +539,7 @@ class SipClient:
         transaction: dict[str, Any] | None = None,
         content_type: str = "text/plain",
         extra_headers: tuple[str, ...] = (),
+        timeout: float = 20,
     ) -> SipMessage:
         # Do not hold the send lock across the response wait: a REGISTER refresh
         # must not block an unrelated door-release MESSAGE for up to 20 s.
@@ -534,6 +552,7 @@ class SipClient:
             transaction=transaction,
             content_type=content_type,
             extra_headers=extra_headers,
+            timeout=timeout,
         )
         if method == "INVITE" and first.status_code and first.status_code >= 300:
             await self._send_failure_ack(uri, transaction, first)
@@ -560,6 +579,7 @@ class SipClient:
                 "Authorization" if first.status_code == 401 else "Proxy-Authorization",
                 authorization,
             ),
+            timeout=timeout,
         )
         if method == "INVITE" and response.status_code and response.status_code >= 300:
             await self._send_failure_ack(uri, transaction, response)
@@ -601,6 +621,7 @@ class SipClient:
         content_type: str = "text/plain",
         extra_headers: tuple[str, ...] = (),
         authorization: tuple[str, str] | None = None,
+        timeout: float = 20,
     ) -> SipMessage:
         transaction = transaction if transaction is not None else {}
         call_id = transaction.setdefault("call_id", secrets.token_hex(12))
@@ -654,7 +675,7 @@ class SipClient:
                     raise SipError("SIP connection is not open")
                 self._writer.write(raw.encode() + body)
                 await self._writer.drain()
-            return await asyncio.wait_for(future, timeout=20)
+            return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._pending.pop((call_id, cseq), None)
 

@@ -10,5 +10,5 @@
   "issue_tracker": "https://github.com/bordeo/ha-bticino-c100x/issues",
   "loggers": ["custom_components.bticino_c100x"],
   "requirements": ["aiortc==1.16.0", "pylibsrtp==1.0.0"],
-  "version": "0.3.2"
+  "version": "0.3.3"
 }

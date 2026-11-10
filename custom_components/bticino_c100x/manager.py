@@ -32,7 +32,7 @@ from .const import (
 from .media_runtime import MediaRuntime, MediaRuntimeError, safe_error_code_for_exception
 from .media_session import MediaSession
 from .models import SipAccount
-from .sip import SipClient, SipError, SipKeepaliveTimeout, SipRegistrationTimeout
+from .sip import SipClient, SipError, SipRegistrationTimeout
 from .topology import visible_external_units, visible_lock_modules
 from .uplink import MicrophoneUplink
 
@@ -41,7 +41,7 @@ _LOGGER = logging.getLogger(__name__)
 
 def _is_sip_link_drop(error: BaseException) -> bool:
     """True when a door release failed because the SIP TLS link went away."""
-    if isinstance(error, (SipRegistrationTimeout, SipKeepaliveTimeout)):
+    if isinstance(error, SipRegistrationTimeout):
         return True
     if isinstance(error, SipError):
         text = str(error).casefold()

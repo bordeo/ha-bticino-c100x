@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.3 — 2026-11-10
+
+### SIP keepalive vs REGISTER health check
+
+v0.3.2 treated a missing RFC 5626 CRLF pong as a dead flow and reconnected.
+Legrand/Azure (`vdesip`, behind an LB that drops idle TCP after ~4 min) does
+**not** answer `CRLFCRLF` with a `CRLF` pong within 10 s, so the socket bounced
+every ~41 s while REGISTER still succeeded.
+
+- **CRLFCRLF every 30 s** still sent to keep the LB flow alive; a missing pong
+  is logged at **debug** only and does **not** reconnect. Framer still strips
+  interleaved CRLF and replies to server pings.
+- **REGISTER refresh every 180 s** on the same connection (Expires **600**,
+  same Call-ID, incrementing CSeq) — below the ~4 min LB idle timeout. Final
+  response timeout **15 s**; non-2xx or timeout triggers reconnect.
+- **Reconnect** only on real failures: socket/EOF/TLS/write error, or REGISTER
+  refresh failure. Backoff remains 1 / 2 / 5 / max 30 s. SO_KEEPALIVE kept.
+- Door release and server-initiated INVITE/doorbell unchanged.
+
 ## 0.3.2 — 2026-11-10
 
 ### SIP transport keepalive
