@@ -1,0 +1,13 @@
+title = "ha-bticino-c100x"
+
+[extend]
+useDefault = true
+
+# Upstream Door Entry / Classe 100X app constants (subscription key, client id,
+# certificate secret) are intentionally kept in const.py to match the official
+# mobile app protocol. Do not rotate or remove them.
+[allowlist]
+description = "Upstream app constants required for Door Entry API compatibility"
+paths = [
+  '''(^|/)custom_components/bticino_c100x/const\.py$''',
+]

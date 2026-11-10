@@ -1,0 +1,67 @@
+<!doctype html><html><head><meta charset="utf-8">
+<style>
+ body{margin:0;padding:24px;font-family:Roboto,Arial,sans-serif;width:420px}
+ body.light{background:#f3f3f3;--primary-color:#03a9f4;--text-primary-color:#fff;--primary-text-color:#212121;
+   --secondary-text-color:#727272;--secondary-background-color:#e5e5e5;--card-background-color:#fff;--error-color:#db4437;--success-color:#43a047}
+ body.dark{background:#111111;--primary-color:#03a9f4;--text-primary-color:#fff;--primary-text-color:#e1e1e1;
+   --secondary-text-color:#9b9b9b;--secondary-background-color:#282828;--card-background-color:#1c1c1c;--error-color:#ef5350;--success-color:#45a14b}
+</style>
+<script>
+window.ICONS = {"mdi:video":"M17,10.5V7A1,1 0 0,0 16,6H4A1,1 0 0,0 3,7V17A1,1 0 0,0 4,18H16A1,1 0 0,0 17,17V13.5L21,17.5V6.5L17,10.5Z","mdi:stop":"M18,18H6V6H18V18Z","mdi:microphone":"M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z","mdi:microphone-off":"M19,11C19,12.19 18.66,13.3 18.1,14.28L16.87,13.05C17.14,12.43 17.3,11.74 17.3,11H19M15,11.16L9,5.18V5A3,3 0 0,1 12,2A3,3 0 0,1 15,5V11L15,11.16M4.27,3L21,19.73L19.73,21L15.54,16.81C14.77,17.27 13.91,17.58 13,17.72V21H11V17.72C7.72,17.23 5,14.41 5,11H6.7C6.7,14 9.24,16.1 12,16.1C12.81,16.1 13.6,15.91 14.31,15.58L12.65,13.92L12,14A3,3 0 0,1 9,11V10.28L3,4.27L4.27,3Z","mdi:door-open":"M12,3C10.89,3 10,3.89 10,5H3V19H2V21H22V19H21V5C21,3.89 20.11,3 19,3H12M12,5H19V19H12V5M5,11H7V13H5V11Z","mdi:doorbell-video":"M14 15C14 16.11 13.11 17 12 17S10 16.11 10 15 10.9 13 12 13 14 13.9 14 15M18 4V20C18 21.1 17.11 22 16 22H8C6.9 22 6 21.11 6 20V4C6 2.9 6.9 2 8 2H16C17.11 2 18 2.9 18 4M10.5 7C10.5 7.83 11.17 8.5 12 8.5S13.5 7.83 13.5 7 12.83 5.5 12 5.5 10.5 6.17 10.5 7M16 10H8V20H16V10Z","mdi:volume-off":"M12,4L9.91,6.09L12,8.18M4.27,3L3,4.27L7.73,9H3V15H7L12,20V13.27L16.25,17.53C15.58,18.04 14.83,18.46 14,18.7V20.77C15.38,20.45 16.63,19.82 17.68,18.96L19.73,21L21,19.73L12,10.73M19,12C19,12.94 18.8,13.82 18.46,14.64L19.97,16.15C20.62,14.91 21,13.5 21,12C21,7.72 18,4.14 14,3.23V5.29C16.89,6.15 19,8.83 19,12M16.5,12C16.5,10.23 15.5,8.71 14,7.97V10.18L16.45,12.63C16.5,12.43 16.5,12.21 16.5,12Z"};
+customElements.define("ha-card", class extends HTMLElement {
+  connectedCallback(){ if(this.shadowRoot) return; const s=this.attachShadow({mode:"open"});
+    s.innerHTML=`<style>:host{display:block;background:var(--card-background-color);border-radius:12px;
+      box-shadow:0 0 0 1px rgba(127,127,127,.2);color:var(--primary-text-color)}
+      .h{font-size:24px;padding:24px 16px 16px;line-height:32px}</style><div class="h">${this.getAttribute("header")||""}</div><slot></slot>`; }
+});
+customElements.define("ha-icon", class extends HTMLElement {
+  static get observedAttributes(){return ["icon"];}
+  connectedCallback(){this.r();} attributeChangedCallback(){this.r();}
+  r(){ if(!this.shadowRoot) this.attachShadow({mode:"open"}); const p=ICONS[this.getAttribute("icon")]||"";
+    this.shadowRoot.innerHTML=`<style>:host{display:inline-flex;width:var(--mdc-icon-size,24px);height:var(--mdc-icon-size,24px)}svg{width:100%;height:100%;fill:currentColor}</style><svg viewBox="0 0 24 24"><path d="${p}"/></svg>`; }
+});
+// iOS-like policy emulation: unmuted playback needs play() during a user gesture
+// on that same element (WebKit removes the restriction per element).
+window.blockedPlays = 0;
+if (new URLSearchParams(location.search).get("ios") === "1") {
+  const unlocked = new WeakSet();
+  const gesture = () => window.__noGesture ? false : navigator.userActivation ? navigator.userActivation.isActive : !!window.__inGesture;
+  document.addEventListener("click", () => { window.__inGesture = true; setTimeout(() => window.__inGesture = false, 0); }, true);
+  const origPlay = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    if (gesture()) unlocked.add(this);
+    if (!this.muted && !unlocked.has(this)) { window.blockedPlays++; return Promise.reject(new DOMException("blocked", "NotAllowedError")); }
+    return origPlay.call(this);
+  };
+  const guard = (e) => { const el = e.target; if (el instanceof HTMLMediaElement && !el.muted && !unlocked.has(el)) { window.blockedPlays++; el.pause(); } };
+  document.addEventListener("play", guard, true);
+  const origAttach = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (init) { const r = origAttach.call(this, init); r.addEventListener("play", guard, true); return r; };
+  window.isUnlocked = (el) => unlocked.has(el);
+}
+function mockStream() {
+  const c = document.createElement("canvas"); c.width = 640; c.height = 360; const g = c.getContext("2d"); let t = 0;
+  const draw = () => { const gr = g.createLinearGradient(0, 0, 640, 360); gr.addColorStop(0, "#3a4a5a"); gr.addColorStop(1, "#8a7a5a");
+    g.fillStyle = gr; g.fillRect(0, 0, 640, 360); g.fillStyle = "#cdb"; g.fillRect(260, 120, 120, 200); g.fillStyle = "#fff";
+    g.font = "20px sans-serif"; g.fillText("mock camera " + (t++), 20, 340); };
+  setInterval(draw, 66); draw();
+  const s = c.captureStream(15);
+  try { const ac = new AudioContext(); const o = ac.createOscillator(); const d = ac.createMediaStreamDestination(); o.connect(d); o.start();
+    s.addTrack(d.stream.getAudioTracks()[0]); } catch (e) {}
+  return s;
+}
+// Mirrors HA: ha-camera-stream > ha-web-rtc-player > <video id="remote-stream" autoplay playsinline .muted .controls>,
+// srcObject assigned when the first remote track arrives.
+customElements.define("ha-web-rtc-player", class extends HTMLElement {
+  connectedCallback() { if (this.shadowRoot) return; const s = this.attachShadow({ mode: "open" });
+    s.innerHTML = `<style>video{width:100%;display:block}</style><video id="remote-stream"></video>`;
+    const v = s.querySelector("video"); v.autoplay = true; v.playsInline = true; v.muted = !!this.muted; v.controls = !!this.controls;
+    window.innerVideo = v;
+    if (!window.VIDEO_OK) return;
+    setTimeout(() => { if (this.isConnected) v.srcObject = mockStream(); }, window.VIDEO_DELAY || 800); }
+});
+customElements.define("ha-camera-stream", class extends HTMLElement {
+  connectedCallback() { const s = this.attachShadow({ mode: "open" }); window.streamsCreated = (window.streamsCreated || 0) + 1;
+    setTimeout(() => { const p = document.createElement("ha-web-rtc-player"); p.muted = this.muted; p.controls = this.controls; s.append(p); }, 300); }
+});
+</script></head><body class="light"><div id="host"></div></body></html>
