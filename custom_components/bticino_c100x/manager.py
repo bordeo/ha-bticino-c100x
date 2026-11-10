@@ -26,13 +26,13 @@ from .const import (
     DOMAIN,
     EVENT_RING,
     RING_ACTIVE_SECONDS,
-    SIP_RECONNECT_SECONDS,
+    SIP_RECONNECT_BACKOFF,
     STORAGE_VERSION,
 )
 from .media_runtime import MediaRuntime, MediaRuntimeError, safe_error_code_for_exception
 from .media_session import MediaSession
 from .models import SipAccount
-from .sip import SipClient, SipError, SipRegistrationTimeout
+from .sip import SipClient, SipError, SipKeepaliveTimeout, SipRegistrationTimeout
 from .topology import visible_external_units, visible_lock_modules
 from .uplink import MicrophoneUplink
 
@@ -41,12 +41,21 @@ _LOGGER = logging.getLogger(__name__)
 
 def _is_sip_link_drop(error: BaseException) -> bool:
     """True when a door release failed because the SIP TLS link went away."""
-    if isinstance(error, SipRegistrationTimeout):
+    if isinstance(error, (SipRegistrationTimeout, SipKeepaliveTimeout)):
         return True
     if isinstance(error, SipError):
         text = str(error).casefold()
         return "connection closed" in text or "connection is not open" in text
     return False
+
+
+def next_reconnect_delay(attempt: int) -> float:
+    """Return the backoff delay for reconnect attempt ``attempt`` (0-based)."""
+    if attempt < 0:
+        attempt = 0
+    if attempt >= len(SIP_RECONNECT_BACKOFF):
+        return float(SIP_RECONNECT_BACKOFF[-1])
+    return float(SIP_RECONNECT_BACKOFF[attempt])
 
 
 class C100XManager:
@@ -302,7 +311,6 @@ class C100XManager:
 
     async def _supervise(self, account: SipAccount) -> None:
         while True:
-            reconnect_immediately = False
             try:
                 assert self._sip is not None
                 await self._sip.wait_closed()
@@ -311,8 +319,7 @@ class C100XManager:
                 raise
             except Exception as err:
                 self.last_error = type(err).__name__
-                # Refresh timeout already spent ~20 s waiting; skip reconnect backoff.
-                reconnect_immediately = isinstance(err, SipRegistrationTimeout)
+                _LOGGER.warning("BTicino SIP connection lost: %s", type(err).__name__)
             self.registered = False
             self._notify()
             if self.microphone_uplink:
@@ -331,15 +338,25 @@ class C100XManager:
                 with contextlib.suppress(Exception):
                     await self._sip.close()
                 self._sip = None
-            if not reconnect_immediately:
-                await asyncio.sleep(SIP_RECONNECT_SECONDS)
-            try:
-                await self._connect(account)
-            except asyncio.CancelledError:
-                raise
-            except Exception as err:
-                self.last_error = type(err).__name__
-                _LOGGER.warning("BTicino SIP reconnect failed: %s", type(err).__name__)
+            # One reconnect at a time: short backoff, fresh DNS+TLS+REGISTER.
+            # Never leave two SipClient instances registered in parallel.
+            attempt = 0
+            while True:
+                delay = next_reconnect_delay(attempt)
+                await asyncio.sleep(delay)
+                try:
+                    await self._connect(account)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:
+                    self.last_error = type(err).__name__
+                    _LOGGER.warning(
+                        "BTicino SIP reconnect failed: %s (next backoff %.0fs)",
+                        type(err).__name__,
+                        next_reconnect_delay(attempt + 1),
+                    )
+                    attempt += 1
 
     async def _media_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("event")

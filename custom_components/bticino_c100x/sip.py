@@ -8,13 +8,18 @@ import hashlib
 import json
 import logging
 import secrets
+import socket
 import ssl
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email.utils import formatdate
 from typing import Any
 
 from .const import (
+    SIP_KEEPALIVE_PING,
+    SIP_KEEPALIVE_PONG,
+    SIP_KEEPALIVE_SECONDS,
+    SIP_KEEPALIVE_TIMEOUT_SECONDS,
     SIP_PORT,
     SIP_REGISTER_EXPIRES,
     SIP_REREGISTER_SECONDS,
@@ -32,6 +37,10 @@ class SipError(Exception):
 
 class SipRegistrationTimeout(SipError):
     """REGISTER refresh got no reply; the TLS link should be reconnected now."""
+
+
+class SipKeepaliveTimeout(SipError):
+    """CRLF keepalive got no pong; the TLS flow is dead and must reconnect."""
 
 
 @dataclass(slots=True)
@@ -93,21 +102,51 @@ def _first_uri(value: str) -> str | None:
     return clean or None
 
 
+@dataclass(slots=True)
+class FramerResult:
+    """SIP messages plus RFC 5626 CRLF keepalive signals."""
+
+    messages: list[SipMessage] = field(default_factory=list)
+    pongs: int = 0
+    server_pings: int = 0
+
+
 class SipFramer:
-    """Extract complete SIP messages from arbitrary TLS chunks."""
+    """Extract complete SIP messages from arbitrary TLS chunks.
+
+    Also consumes RFC 5626 CRLF keepalives interleaved with SIP:
+    - ``\\r\\n`` — pong (response to our ping)
+    - ``\\r\\n\\r\\n`` — server-initiated ping
+    Leading CRLF must be stripped before parsing so the next real response
+    is not seen as an empty start-line "request".
+    """
 
     def __init__(self) -> None:
         self._buffer = bytearray()
 
-    def feed(self, data: bytes) -> list[SipMessage]:
+    def feed(self, data: bytes) -> FramerResult:
         self._buffer.extend(data)
-        messages: list[SipMessage] = []
+        result = FramerResult()
         while True:
+            # Server ping first (also matches a leading double-CRLF).
+            if self._buffer.startswith(SIP_KEEPALIVE_PING):
+                del self._buffer[: len(SIP_KEEPALIVE_PING)]
+                result.server_pings += 1
+                continue
+            # Client/server pong: a lone CRLF (not part of CRLFCRLF).
+            if self._buffer.startswith(SIP_KEEPALIVE_PONG):
+                del self._buffer[: len(SIP_KEEPALIVE_PONG)]
+                result.pongs += 1
+                continue
             header_end = self._buffer.find(b"\r\n\r\n")
             if header_end < 0:
                 break
             header_blob = bytes(self._buffer[:header_end]).decode("utf-8", errors="replace")
             lines = header_blob.split("\r\n")
+            if not lines or not lines[0]:
+                # Should not happen after CRLF stripping; drop the delimiter.
+                del self._buffer[: header_end + 4]
+                continue
             headers: dict[str, str] = {}
             for line in lines[1:]:
                 if ":" in line:
@@ -124,8 +163,8 @@ class SipFramer:
                 break
             body = bytes(self._buffer[header_end + 4 : total])
             del self._buffer[:total]
-            messages.append(SipMessage(lines[0], headers, body))
-        return messages
+            result.messages.append(SipMessage(lines[0], headers, body))
+        return result
 
 
 def _create_ssl_context(
@@ -202,6 +241,7 @@ class SipClient:
         self._writer: asyncio.StreamWriter | None = None
         self._read_task: asyncio.Task | None = None
         self._registration_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
         self._pending: dict[tuple[str, str], asyncio.Future[SipMessage]] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._send_lock = asyncio.Lock()
@@ -211,6 +251,7 @@ class SipClient:
         self._reg_call_id: str | None = None
         self._reg_from_tag: str | None = None
         self._reg_cseq = 0
+        self._pong_event = asyncio.Event()
         self.registered = False
 
     async def connect(self) -> None:
@@ -220,25 +261,42 @@ class SipClient:
             self._private_key_path,
             self._ca_path,
         )
+        # Fresh DNS every connect (open_connection resolves SIP_SERVER again).
         self._reader, self._writer = await asyncio.open_connection(
             SIP_SERVER, SIP_PORT, ssl=context, server_hostname=SIP_SERVER
         )
+        self._enable_tcp_keepalive()
         self._read_task = asyncio.create_task(self._read_loop())
         await self.register()
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         self._registration_task = asyncio.create_task(self._refresh_registration())
+
+    def _enable_tcp_keepalive(self) -> None:
+        """Optional OS-level TCP keepalive as a backstop for the CRLF pings."""
+        if not self._writer:
+            return
+        sock = self._writer.get_extra_info("socket")
+        if sock is None:
+            return
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, SIP_KEEPALIVE_SECONDS)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
 
     async def close(self) -> None:
         with contextlib.suppress(Exception):
             await self.end_monitoring()
         self.registered = False
-        if self._registration_task:
-            self._registration_task.cancel()
-            await asyncio.gather(self._registration_task, return_exceptions=True)
-            self._registration_task = None
-        if self._read_task:
-            self._read_task.cancel()
-            await asyncio.gather(self._read_task, return_exceptions=True)
-            self._read_task = None
+        for attr in ("_keepalive_task", "_registration_task", "_read_task"):
+            task = getattr(self, attr)
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                setattr(self, attr, None)
         if self._writer:
             self._writer.close()
             # TLS peers can close first or abort the shutdown handshake. The
@@ -258,8 +316,12 @@ class SipClient:
         self._pending.clear()
 
     async def wait_closed(self) -> None:
-        """Wait until the remote connection ends or its reader fails."""
-        tasks = {task for task in (self._read_task, self._registration_task) if task}
+        """Wait until the remote connection ends or a keepalive/refresh fails."""
+        tasks = {
+            task
+            for task in (self._read_task, self._registration_task, self._keepalive_task)
+            if task
+        }
         if not tasks:
             return
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -298,6 +360,36 @@ class SipClient:
                 raise SipRegistrationTimeout(
                     "SIP registration refresh timed out"
                 ) from err
+
+    async def _keepalive_loop(self) -> None:
+        """Send RFC 5626 CRLFCRLF every 30 s; require a CRLF pong within ~10 s."""
+        while True:
+            await asyncio.sleep(SIP_KEEPALIVE_SECONDS)
+            if not self.registered or not self._writer:
+                continue
+            self._pong_event.clear()
+            try:
+                async with self._send_lock:
+                    if not self._writer:
+                        raise SipError("SIP connection is not open")
+                    self._writer.write(SIP_KEEPALIVE_PING)
+                    await self._writer.drain()
+                await asyncio.wait_for(
+                    self._pong_event.wait(), timeout=SIP_KEEPALIVE_TIMEOUT_SECONDS
+                )
+            except TimeoutError as err:
+                _LOGGER.warning(
+                    "BTicino SIP keepalive pong timed out; reconnecting"
+                )
+                raise SipKeepaliveTimeout("SIP keepalive pong timed out") from err
+
+    async def _reply_server_ping(self) -> None:
+        """Answer a server CRLFCRLF ping with a single CRLF pong."""
+        async with self._send_lock:
+            if not self._writer:
+                return
+            self._writer.write(SIP_KEEPALIVE_PONG)
+            await self._writer.drain()
 
     async def release_door(self, lock_id: str, gateway_id: str) -> None:
         """Release a Classe 100X strike using its topology module ID."""
@@ -570,12 +662,24 @@ class SipClient:
         assert self._reader is not None
         framer = SipFramer()
         while data := await self._reader.read(8192):
-            for message in framer.feed(data):
+            parsed = framer.feed(data)
+            if parsed.pongs:
+                self._pong_event.set()
+            for _ in range(parsed.server_pings):
+                await self._reply_server_ping()
+            for message in parsed.messages:
                 if message.status_code is not None:
-                    key = (message.headers.get("call-id", ""), message.headers.get("cseq", ""))
+                    key = (
+                        message.headers.get("call-id", ""),
+                        message.headers.get("cseq", ""),
+                    )
                     # SIP 1xx messages (notably 100 Trying) are provisional.
                     # Keep waiting for the final authentication or success response.
-                    if message.status_code >= 200 and (future := self._pending.get(key)) and not future.done():
+                    if (
+                        message.status_code >= 200
+                        and (future := self._pending.get(key))
+                        and not future.done()
+                    ):
                         future.set_result(message)
                 else:
                     await self._handle_request(message)

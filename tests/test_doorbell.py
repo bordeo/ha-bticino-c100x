@@ -63,7 +63,7 @@ def make_manager(loop):
 
 
 async def feed(sip, raw: bytes):
-    for msg in SipFramer().feed(raw):
+    for msg in SipFramer().feed(raw).messages:
         await sip._handle_request(msg)
 
 

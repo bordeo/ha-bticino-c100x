@@ -34,6 +34,13 @@ SIP_PORT = 5228
 SIP_REGISTER_EXPIRES = 600
 SIP_REREGISTER_SECONDS = 480
 SIP_RECONNECT_SECONDS = 10
+# RFC 5626 CRLF keepalive (Door Entry app: ping every 30 s, pong = CRLF).
+SIP_KEEPALIVE_SECONDS = 30
+SIP_KEEPALIVE_TIMEOUT_SECONDS = 10
+SIP_KEEPALIVE_PING = b"\r\n\r\n"
+SIP_KEEPALIVE_PONG = b"\r\n"
+# Short reconnect backoff after refresh/keepalive/socket failure (seconds).
+SIP_RECONNECT_BACKOFF = (1, 2, 5, 30)
 SIP_USER_AGENT = "ha-bticino-c100x/0.1"
 
 # Certificate profile used by the official Classe 100X application.
