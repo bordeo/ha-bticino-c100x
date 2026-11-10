@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.2 — 2026-11-10
+
+### SIP transport keepalive
+
+- **RFC 5626 CRLF keepalive** every 30 s (`\r\n\r\n` ping, expect `\r\n` pong
+  within 10 s). Matches the official Door Entry app and keeps the Azure LB flow
+  alive (idle timeout ~4 min). Without this, the 480 s REGISTER refresh hit a
+  dead socket → 20 s timeout → ~2 min outage.
+- **SipFramer** strips leading/interleaved CRLF pongs and server CRLFCRLF pings
+  so they cannot corrupt the next SIP response; replies to server pings with a
+  single CRLF.
+- **Reconnect** after refresh timeout, keepalive timeout, or socket error: fresh
+  DNS + new TLS + full REGISTER with short backoff (1 s, 2 s, 5 s, max 30 s).
+  Only one SipClient at a time (no parallel registrations).
+- Optional TCP SO_KEEPALIVE on the SIP socket.
+- Door-release semantics unchanged (still at most one retry on link drop).
+
 ## 0.3.1 — 2026-11-10
 
 ### SIP registration refresh
