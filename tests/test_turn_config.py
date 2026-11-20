@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 
 PKG = Path(__file__).resolve().parents[1] / "custom_components" / "bticino_c100x"
 
@@ -19,6 +23,9 @@ def _load(name: str):
 
 
 cfg = _load("webrtc_config")
+
+# Full HA is present in CI; import the real turn module for credential resolution.
+from custom_components.bticino_c100x import turn as turn_mod  # noqa: E402
 
 CF_PAYLOAD = {
     "iceServers": [
@@ -90,3 +97,103 @@ def test_rtc_configuration_adds_relay_for_aiortc() -> None:
     assert kwargs["turn_server"] == ("turn.cloudflare.com", 3478)
     assert kwargs["turn_username"] == "u"
     assert kwargs["turn_transport"] == "udp"
+
+
+def test_read_turn_file_missing_returns_none(tmp_path: Path) -> None:
+    assert turn_mod._read_turn_file(tmp_path / "bticino_turn.yaml") is None
+
+
+def test_read_turn_file_valid(tmp_path: Path) -> None:
+    path = tmp_path / "bticino_turn.yaml"
+    path.write_text(
+        'cloudflare_turn_key_id: "kid"\ncloudflare_turn_api_token: "tok"\n',
+        encoding="utf-8",
+    )
+    assert turn_mod._read_turn_file(path) == {
+        "cloudflare_turn_key_id": "kid",
+        "cloudflare_turn_api_token": "tok",
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not: a: mapping: [",
+        "cloudflare_turn_key_id: kid\n",
+        "cloudflare_turn_api_token: tok\n",
+        "cloudflare_turn_key_id: ''\ncloudflare_turn_api_token: tok\n",
+        "cloudflare_turn_key_id: kid\ncloudflare_turn_api_token: ''\n",
+        "- just a list\n",
+        "cloudflare_turn_key_id: 123\ncloudflare_turn_api_token: tok\n",
+    ],
+)
+def test_read_turn_file_malformed_raises(tmp_path: Path, body: str) -> None:
+    path = tmp_path / "bticino_turn.yaml"
+    path.write_text(body, encoding="utf-8")
+    with pytest.raises(ValueError):
+        turn_mod._read_turn_file(path)
+
+
+def _hass_with_config_path(config_dir: Path) -> MagicMock:
+    hass = MagicMock()
+    hass.config.path = lambda *parts: str(config_dir.joinpath(*parts))
+
+    async def _executor(func, *args):
+        return func(*args)
+
+    hass.async_add_executor_job = _executor
+    return hass
+
+
+@pytest.mark.asyncio
+async def test_resolve_prefers_yaml_block_over_file(tmp_path: Path) -> None:
+    (tmp_path / "bticino_turn.yaml").write_text(
+        'cloudflare_turn_key_id: "file-kid"\ncloudflare_turn_api_token: "file-tok"\n',
+        encoding="utf-8",
+    )
+    hass = _hass_with_config_path(tmp_path)
+    resolved = await turn_mod._async_resolve_turn_credentials(
+        hass,
+        {
+            "cloudflare_turn_key_id": "yaml-kid",
+            "cloudflare_turn_api_token": "yaml-tok",
+        },
+    )
+    assert resolved == ("yaml-kid", "yaml-tok")
+
+
+@pytest.mark.asyncio
+async def test_resolve_falls_back_to_file(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    (tmp_path / "bticino_turn.yaml").write_text(
+        'cloudflare_turn_key_id: "file-kid"\ncloudflare_turn_api_token: "file-tok"\n',
+        encoding="utf-8",
+    )
+    hass = _hass_with_config_path(tmp_path)
+    with caplog.at_level(logging.DEBUG, logger=turn_mod.__name__):
+        resolved = await turn_mod._async_resolve_turn_credentials(hass, {})
+    assert resolved == ("file-kid", "file-tok")
+    assert "TURN credentials loaded from bticino_turn.yaml" in caplog.text
+    assert "file-tok" not in caplog.text
+    assert "file-kid" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_missing_file_is_silent(tmp_path: Path) -> None:
+    hass = _hass_with_config_path(tmp_path)
+    assert await turn_mod._async_resolve_turn_credentials(hass, {}) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_malformed_file_warns_without_values(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "bticino_turn.yaml").write_text(
+        'cloudflare_turn_key_id: "secret-kid"\n',
+        encoding="utf-8",
+    )
+    hass = _hass_with_config_path(tmp_path)
+    with caplog.at_level(logging.WARNING, logger=turn_mod.__name__):
+        resolved = await turn_mod._async_resolve_turn_credentials(hass, {})
+    assert resolved is None
+    assert "malformed" in caplog.text
+    assert "secret-kid" not in caplog.text
