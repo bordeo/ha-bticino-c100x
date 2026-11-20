@@ -150,8 +150,9 @@ plain HTTP cannot capture audio; the card shows that clearly and disables mic.
 Door audio uses the same SIP offer shape as Door Entry (Opus/Speex/G.711). The
 outdoor unit typically answers **Speex/8000** and only sends downlink after it
 receives continuous uplink Speex (silence keepalive while the mic is muted).
-If the door sounds quiet, raise **Door audio gain (dB)** in the integration
-options (default **+12 dB**, clipped).
+Mic talkback encodes Speex in-process (vendored `libspeex`) because HA’s ffmpeg
+build usually has no `libspeex` encoder. If the door sounds quiet, raise
+**Door audio gain (dB)** in the integration options (default **+12 dB**, clipped).
 
 ## Development / tests
 

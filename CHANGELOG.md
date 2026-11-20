@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.8 — 2026-11-20
+
+- **Mic talkback without ffmpeg libspeex:** Home Assistant’s Alpine ffmpeg build does not include Speex, so v0.3.7 silence keepalive worked but unmuted mic frames were dropped. Add an in-process Speex encoder (ctypes + vendored `libspeex` for musl/gnu × x86_64/aarch64; system `libspeex` preferred when present). Prefer native encoder; keep ffmpeg Speex as fallback. Log which encoder is used; disable talkback only if both fail. Canned Speex silence remains for muted keepalive.
+
 ## 0.3.7 — 2026-11-20
 
 - **Door listen/talk audio:** SIP offer matches Door Entry (Opus → Speex → G.711). The C100X rejects PCMA/PCMU-only offers (audio port 0); with the full offer it answers Speex/8000. Keep the negotiated codec/PT for both directions.

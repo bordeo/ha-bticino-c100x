@@ -23,6 +23,7 @@ from av.audio.resampler import AudioResampler
 from .audio_codec import (
     OpusEncoder,
     SpeexFfmpegEncoder,
+    SpeexNativeEncoder,
     TalkbackFormat,
     apply_gain_s16,
     resolve_ffmpeg,
@@ -146,8 +147,10 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         self._first_packet = True
         self._gain_db = DEFAULT_AUDIO_GAIN_DB
         self._opus: OpusEncoder | None = None
+        self._speex_native: SpeexNativeEncoder | None = None
         self._speex: SpeexFfmpegEncoder | None = None
         self._speex_pending = False
+        self._speex_backend: str | None = None
         self._speex_chain: asyncio.Task[None] | None = None
         self._speex_epoch = 0
 
@@ -215,20 +218,41 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         self._outbound = pylibsrtp.Session(outbound_policy)
 
     async def prepare_encoders(self, ffmpeg_path: str | None = None) -> None:
-        """Start Speex ffmpeg encoder when that codec was negotiated."""
+        """Prepare Speex talkback: prefer in-process libspeex, ffmpeg as fallback."""
         if not self._speex_pending or self._codec is None:
             return
+        rate = self._codec.clock_rate or 8000
+        # 1) In-process ctypes Speex (works on HA Alpine where ffmpeg lacks libspeex).
+        try:
+            native = SpeexNativeEncoder(sample_rate=rate, quality=8, vbr=True)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "In-process Speex encoder unavailable (%s); trying ffmpeg libspeex",
+                err,
+            )
+            native = None
+        if native is not None:
+            self._speex_native = native
+            self._speex_backend = "native-libspeex"
+            self._speex_pending = False
+            _LOGGER.warning(
+                "BTicino Speex talkback using in-process libspeex encoder (%s Hz, VBR)",
+                rate,
+            )
+            return
+
+        # 2) Optional ffmpeg libspeex fallback (rare on stock HA images).
         path = resolve_ffmpeg(ffmpeg_path)
         if not path:
             _LOGGER.error(
-                "Speex negotiated but ffmpeg was not found; "
+                "Speex negotiated but no in-process encoder and ffmpeg was not found; "
                 "mic talkback disabled (canned silence keepalive still runs)"
             )
             self._speex_pending = False
             return
         encoder = SpeexFfmpegEncoder(
             ffmpeg_path=path,
-            sample_rate=self._codec.clock_rate or 8000,
+            sample_rate=rate,
             payload_type=self._codec.payload_type,
         )
         self._speex = encoder
@@ -239,13 +263,15 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
             with contextlib.suppress(Exception):
                 await encoder.close()
             _LOGGER.error(
-                "Speex negotiated but ffmpeg libspeex encoder failed (%s); "
-                "mic talkback disabled (canned silence keepalive still runs)",
+                "Speex negotiated but both in-process and ffmpeg libspeex encoders "
+                "failed (%s); mic talkback disabled (canned silence keepalive still runs)",
                 err,
             )
             self._speex_pending = False
             return
+        self._speex_backend = "ffmpeg-libspeex"
         self._speex_pending = False
+        _LOGGER.warning("BTicino Speex talkback using ffmpeg libspeex encoder")
 
     @property
     def talkback_encoder_ready(self) -> bool:
@@ -258,6 +284,8 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         if name == "opus":
             return self._opus is not None
         if name == "speex":
+            if self._speex_native is not None and self._speex_native.alive:
+                return True
             return self._speex is not None and self._speex.alive
         return False
 
@@ -343,7 +371,14 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
                     continue
                 self._send_payload(payload, samples=self._opus.frame_samples)
             elif name == "speex":
-                if self._speex is None:
+                if self._speex_native is not None and self._speex_native.alive:
+                    try:
+                        payload = self._speex_native.encode(chunk)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    self._send_payload(payload, samples=self._fmt.frame_samples)
+                    continue
+                if self._speex is None or not self._speex.alive:
                     # Encoder missing: keepalive continues silence; skip mic PCM.
                     continue
                 prev = self._speex_chain
@@ -449,9 +484,14 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         if chain is not None:
             chain.cancel()
             await asyncio.gather(chain, return_exceptions=True)
+        native, self._speex_native = self._speex_native, None
+        if native is not None:
+            with contextlib.suppress(Exception):
+                native.close()
         speex, self._speex = self._speex, None
         if speex is not None:
             await speex.close()
+        self._speex_backend = None
 
     def close(self) -> None:
         self.set_microphone(False)

@@ -4,13 +4,35 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
+import ctypes.util
 import logging
+import platform
 import shutil
 import subprocess
+from ctypes import (
+    POINTER,
+    Structure,
+    addressof,
+    byref,
+    c_char,
+    c_char_p,
+    c_int,
+    c_int16,
+    c_void_p,
+    create_string_buffer,
+)
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+
+# Speex 1.2 ctl request ids (even = set). See include/speex/speex.h.
+_SPEEX_GET_FRAME_SIZE = 3
+_SPEEX_SET_QUALITY = 4
+_SPEEX_SET_VBR = 12
+_SPEEX_SET_VBR_QUALITY = 14
 
 # Steady-state narrowband Speex (8000 Hz, 20 ms) silence payload captured from
 # libspeex via Ogg (no RTP header). Used for uplink keepalive so the door opens
@@ -111,6 +133,192 @@ class OpusEncoder:
 
     def encode_silence(self) -> bytes:
         return self.encode(b"\x00" * (self.frame_samples * self.channels * 2))
+
+
+class _SpeexBits(Structure):
+    """libspeex bit-packer state (SpeexBits)."""
+
+    _fields_ = [
+        ("chars", c_void_p),
+        ("nbBits", c_int),
+        ("charPtr", c_int),
+        ("bitPtr", c_int),
+        ("owner", c_int),
+        ("overflow", c_int),
+        ("buf_size", c_int),
+        ("reserved1", c_int),
+        ("reserved2", c_void_p),
+    ]
+
+
+def _is_musl() -> bool:
+    """Return True when running under musl (HA Container / Alpine)."""
+    for root in (Path("/lib"), Path("/usr/lib"), Path("/lib64"), Path("/")):
+        try:
+            if any(root.glob("lib/ld-musl-*")) or any(root.glob("ld-musl-*")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _vendor_libspeex_path() -> Path | None:
+    """Return the vendored libspeex.so path for this OS/arch/libc, if present."""
+    system = platform.system().casefold()
+    machine = platform.machine().casefold()
+    if system != "linux":
+        return None
+    if machine in {"x86_64", "amd64"}:
+        arch = "x86_64"
+    elif machine in {"aarch64", "arm64"}:
+        arch = "aarch64"
+    else:
+        return None
+    libc = "musl" if _is_musl() else "gnu"
+    base = Path(__file__).resolve().parent / "vendor" / "libspeex" / f"linux_{arch}_{libc}"
+    for name in ("libspeex.so.1", "libspeex.so.1.5.2", "libspeex.so"):
+        path = base / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _load_libspeex() -> ctypes.CDLL:
+    """Load libspeex: system library first, then vendored musl/gnu builds."""
+    errors: list[str] = []
+    for candidate in (
+        "libspeex.so.1",
+        "libspeex.so",
+        "speex",
+    ):
+        try:
+            if candidate == "speex":
+                found = ctypes.util.find_library("speex")
+                if not found:
+                    continue
+                return ctypes.CDLL(found)
+            return ctypes.CDLL(candidate)
+        except OSError as err:
+            errors.append(f"{candidate}: {err}")
+    vendored = _vendor_libspeex_path()
+    if vendored is not None:
+        try:
+            return ctypes.CDLL(str(vendored))
+        except OSError as err:
+            errors.append(f"{vendored}: {err}")
+    raise OSError(
+        "libspeex not available (HA ffmpeg has no Speex; tried system + vendored): "
+        + "; ".join(errors)
+    )
+
+
+class SpeexNativeEncoder:
+    """In-process narrowband/wideband Speex encoder via ctypes + libspeex.
+
+    Home Assistant's Alpine ffmpeg build does not include ``libspeex``, so mic
+    talkback cannot use SpeexFfmpegEncoder there. No maintained PyPI Speex
+    codec wheel covers Python 3.14 + musllinux, so we ctypes-bind libspeex and
+    ship musl/gnu x86_64+aarch64 shared objects under ``vendor/libspeex/``.
+    """
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 8000,
+        quality: int = 8,
+        vbr: bool = True,
+    ) -> None:
+        if sample_rate not in {8000, 16000}:
+            raise ValueError(f"Unsupported Speex sample rate: {sample_rate}")
+        self.sample_rate = sample_rate
+        self.channels = 1
+        self.frame_samples = sample_rate // 50  # 20 ms
+        self._lib = _load_libspeex()
+        self._bind()
+        mode_name = "speex_nb_mode" if sample_rate == 8000 else "speex_wb_mode"
+        mode_blob = (c_char * 1).in_dll(self._lib, mode_name)
+        self._encoder = self._lib.speex_encoder_init(addressof(mode_blob))
+        if not self._encoder:
+            raise RuntimeError("speex_encoder_init failed")
+        quality_c = c_int(int(quality))
+        vbr_c = c_int(1 if vbr else 0)
+        vbr_quality_c = c_int(int(quality))
+        frame_size = c_int()
+        if self._lib.speex_encoder_ctl(self._encoder, _SPEEX_SET_QUALITY, byref(quality_c)):
+            raise RuntimeError("SPEEX_SET_QUALITY failed")
+        if vbr and self._lib.speex_encoder_ctl(self._encoder, _SPEEX_SET_VBR, byref(vbr_c)):
+            raise RuntimeError("SPEEX_SET_VBR failed")
+        if vbr:
+            self._lib.speex_encoder_ctl(
+                self._encoder, _SPEEX_SET_VBR_QUALITY, byref(vbr_quality_c)
+            )
+        if self._lib.speex_encoder_ctl(
+            self._encoder, _SPEEX_GET_FRAME_SIZE, byref(frame_size)
+        ):
+            raise RuntimeError("SPEEX_GET_FRAME_SIZE failed")
+        if frame_size.value != self.frame_samples:
+            self.close()
+            raise RuntimeError(
+                f"Unexpected Speex frame size {frame_size.value} (expected {self.frame_samples})"
+            )
+        self._bits = _SpeexBits()
+        self._lib.speex_bits_init(byref(self._bits))
+        self._out = create_string_buffer(200)
+        self._closed = False
+
+    def _bind(self) -> None:
+        lib = self._lib
+        lib.speex_encoder_init.argtypes = [c_void_p]
+        lib.speex_encoder_init.restype = c_void_p
+        lib.speex_encoder_destroy.argtypes = [c_void_p]
+        lib.speex_encoder_destroy.restype = None
+        lib.speex_encoder_ctl.argtypes = [c_void_p, c_int, c_void_p]
+        lib.speex_encoder_ctl.restype = c_int
+        lib.speex_bits_init.argtypes = [POINTER(_SpeexBits)]
+        lib.speex_bits_init.restype = None
+        lib.speex_bits_destroy.argtypes = [POINTER(_SpeexBits)]
+        lib.speex_bits_destroy.restype = None
+        lib.speex_bits_reset.argtypes = [POINTER(_SpeexBits)]
+        lib.speex_bits_reset.restype = None
+        lib.speex_encode_int.argtypes = [c_void_p, POINTER(c_int16), POINTER(_SpeexBits)]
+        lib.speex_encode_int.restype = c_int
+        lib.speex_bits_write.argtypes = [POINTER(_SpeexBits), c_char_p, c_int]
+        lib.speex_bits_write.restype = c_int
+
+    @property
+    def alive(self) -> bool:
+        return not self._closed and bool(self._encoder)
+
+    def encode(self, pcm_s16le: bytes) -> bytes:
+        if not self.alive:
+            raise RuntimeError("Speex encoder is closed")
+        expected = self.frame_samples * 2
+        if len(pcm_s16le) != expected:
+            raise ValueError(
+                f"Speex PCM frame has unexpected length {len(pcm_s16le)} (expected {expected})"
+            )
+        samples = (c_int16 * self.frame_samples).from_buffer_copy(pcm_s16le)
+        self._lib.speex_bits_reset(byref(self._bits))
+        self._lib.speex_encode_int(self._encoder, samples, byref(self._bits))
+        nbytes = self._lib.speex_bits_write(byref(self._bits), self._out, len(self._out))
+        if nbytes <= 0:
+            raise RuntimeError("speex_bits_write returned empty frame")
+        return bytes(self._out.raw[:nbytes])
+
+    def encode_silence(self) -> bytes:
+        return self.encode(b"\x00" * (self.frame_samples * 2))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if getattr(self, "_bits", None) is not None:
+            with contextlib.suppress(Exception):
+                self._lib.speex_bits_destroy(byref(self._bits))
+        if getattr(self, "_encoder", None):
+            with contextlib.suppress(Exception):
+                self._lib.speex_encoder_destroy(self._encoder)
+        self._encoder = None
 
 
 class SpeexFfmpegEncoder:
