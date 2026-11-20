@@ -21,9 +21,11 @@ from .auth import C100XAuth
 from .certificate import certificate_expiry, provision_certificate
 from .const import (
     CERTIFICATE_RENEWAL_DAYS,
+    CONF_AUDIO_GAIN_DB,
     CONF_GATEWAY_ID,
     CONF_HOME_ID,
     CONF_LOCK_IDS,
+    DEFAULT_AUDIO_GAIN_DB,
     DOMAIN,
     EVENT_RING,
     RING_ACTIVE_SECONDS,
@@ -290,11 +292,18 @@ class C100XManager:
             raise MediaRuntimeError("Home Assistant FFmpeg is unavailable")
         gateway = self.entry.data[CONF_GATEWAY_ID]
         domain = gateway if gateway.endswith(".bs.iotleg.com") else f"{gateway}.bs.iotleg.com"
+        try:
+            gain_db = float(
+                self.entry.options.get(CONF_AUDIO_GAIN_DB, DEFAULT_AUDIO_GAIN_DB)
+            )
+        except (TypeError, ValueError):
+            gain_db = DEFAULT_AUDIO_GAIN_DB
         runtime = MediaRuntime(
             sip,
             ffmpeg.binary,
             self._media_event,
             allocate_generation=self.allocate_media_generation,
+            audio_gain_db=gain_db,
         )
         self._sip = sip
         self._runtime = runtime

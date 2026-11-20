@@ -15,11 +15,13 @@ from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from .api import ApiError, LegrandApi, log_api_failure
 from .auth import AuthenticationError, C100XAuth, log_auth_failure
 from .const import (
+    CONF_AUDIO_GAIN_DB,
     CONF_GATEWAY_ID,
     CONF_HOME_ID,
     CONF_LOCK_IDS,
     CONF_TURN_API_TOKEN,
     CONF_TURN_KEY_ID,
+    DEFAULT_AUDIO_GAIN_DB,
     DOMAIN,
 )
 from .topology import button_id, open_address, visible_lock_modules
@@ -277,7 +279,12 @@ class C100XOptionsFlow(config_entries.OptionsFlow):
                     data_schema=self._schema(),
                     errors={"base": "incomplete_turn"},
                 )
-            data: dict[str, Any] = {CONF_LOCK_IDS: user_input[CONF_LOCK_IDS]}
+            data: dict[str, Any] = {
+                CONF_LOCK_IDS: user_input[CONF_LOCK_IDS],
+                CONF_AUDIO_GAIN_DB: float(
+                    user_input.get(CONF_AUDIO_GAIN_DB, DEFAULT_AUDIO_GAIN_DB)
+                ),
+            }
             if turn_options:
                 data.update(turn_options)
             return self.async_create_entry(data=data)
@@ -298,9 +305,18 @@ class C100XOptionsFlow(config_entries.OptionsFlow):
             CONF_LOCK_IDS, self.config_entry.data[CONF_LOCK_IDS]
         )
         current_key = str(self.config_entry.options.get(CONF_TURN_KEY_ID) or "")
+        try:
+            current_gain = float(
+                self.config_entry.options.get(CONF_AUDIO_GAIN_DB, DEFAULT_AUDIO_GAIN_DB)
+            )
+        except (TypeError, ValueError):
+            current_gain = DEFAULT_AUDIO_GAIN_DB
         return vol.Schema(
             {
                 vol.Required(CONF_LOCK_IDS, default=current_locks): _lock_selector(self._choices),
+                vol.Optional(CONF_AUDIO_GAIN_DB, default=current_gain): vol.All(
+                    vol.Coerce(float), vol.Range(min=-12.0, max=24.0)
+                ),
                 vol.Optional(CONF_TURN_KEY_ID, default=current_key): str,
                 vol.Optional(CONF_TURN_API_TOKEN): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)

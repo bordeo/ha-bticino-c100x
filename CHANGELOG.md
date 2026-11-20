@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.7 — 2026-11-20
+
+- **Door listen/talk audio:** SIP offer matches Door Entry (Opus → Speex → G.711). The C100X rejects PCMA/PCMU-only offers (audio port 0); with the full offer it answers Speex/8000. Keep the negotiated codec/PT for both directions.
+- Continuous Speex silence uplink every 20 ms from call start (`sendrecv`, like Door Entry with a locally muted mic) so the door opens downlink; real mic frames replace silence when unmuted. Speex decode (PyAV) → WebRTC PCM; mic PCM → Speex (ffmpeg libspeex) / G.711 / optional Opus.
+- Downlink **audio gain** option (default **+12 dB**, hard limiter/clip). Configurable in integration options (`audio_gain_db`, −12…+24).
+- Card JS content-hash digest computed via `hass.async_add_executor_job` (no blocking `read_bytes` on the event loop). Existing TURN support unchanged.
+
 ## 0.3.6 — 2026-11-20
 
 - Microphone uplink now uses the same ICE servers as the video peer (HA `camera/webrtc/get_client_config`, including Cloudflare TURN). The aiortc mic peer also gathers TURN relay candidates. Fixes mic/ICE failure from cellular CGNAT when video already worked via TURN.

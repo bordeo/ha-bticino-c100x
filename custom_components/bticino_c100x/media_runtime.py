@@ -18,13 +18,25 @@ import av
 import pylibsrtp
 from aiortc import MediaStreamTrack
 from aiortc.rtp import RtpPacket
+from av.audio.resampler import AudioResampler
 
+from .audio_codec import (
+    OpusEncoder,
+    SpeexFfmpegEncoder,
+    TalkbackFormat,
+    apply_gain_s16,
+    resolve_ffmpeg,
+    speex_silence_frame,
+    talkback_format_for,
+)
+from .const import DEFAULT_AUDIO_GAIN_DB
 from .sdp import (
     Codec,
     NegotiatedSession,
     build_monitoring_offer,
     build_receive_sdp,
     parse_answer,
+    select_audio_codec,
 )
 from .sip import SipClient
 
@@ -112,7 +124,7 @@ class AudioReceiveTrack(MediaStreamTrack):
 
 
 class AudioRtpProtocol(asyncio.DatagramProtocol):
-    """Receive and send one negotiated G.711 SRTP stream on the same port."""
+    """Receive and send one negotiated Opus/Speex/G.711 SRTP stream."""
 
     def __init__(self, media_received: Callable[[], None]) -> None:
         self.media_received = media_received
@@ -122,7 +134,9 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         self._outbound: pylibsrtp.Session | None = None
         self._decoder: av.AudioCodecContext | None = None
         self._encoder: av.AudioCodecContext | None = None
+        self._downlink_resampler: AudioResampler | None = None
         self._codec: Codec | None = None
+        self._fmt: TalkbackFormat | None = None
         self._remote: tuple[str, int] | None = None
         self._microphone_enabled = False
         self._pcm = bytearray()
@@ -130,28 +144,63 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         self._timestamp = secrets.randbelow(2**32)
         self._ssrc = secrets.randbelow(2**32)
         self._first_packet = True
+        self._gain_db = DEFAULT_AUDIO_GAIN_DB
+        self._opus: OpusEncoder | None = None
+        self._speex: SpeexFfmpegEncoder | None = None
+        self._speex_pending = False
+        self._speex_chain: asyncio.Task[None] | None = None
+        self._speex_epoch = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
 
-    def configure(self, session: NegotiatedSession) -> None:
+    def configure(self, session: NegotiatedSession, *, gain_db: float = DEFAULT_AUDIO_GAIN_DB) -> None:
         media = session.audio
         if media is None or media.crypto is None:
             return
-        codec = media.codec({"pcma", "pcmu"})
+        codec = select_audio_codec(media)
         if codec is None:
             raise MediaRuntimeError("No supported negotiated microphone codec")
-        decoder_name = "pcm_alaw" if codec.name.casefold() == "pcma" else "pcm_mulaw"
-        self._decoder = av.CodecContext.create(decoder_name, "r")
-        self._decoder.sample_rate = codec.clock_rate
-        self._decoder.layout = "mono"
-        self._decoder.format = "s16"
-        self._encoder = av.CodecContext.create(decoder_name, "w")
-        self._encoder.sample_rate = codec.clock_rate
-        self._encoder.layout = "mono"
-        self._encoder.format = "s16"
+        self._gain_db = float(gain_db)
         self._codec = codec
+        self._fmt = talkback_format_for(codec)
         self._remote = (media.connection, media.port)
+        name = codec.name.casefold()
+        self._decoder = None
+        self._encoder = None
+        self._opus = None
+        self._speex_pending = False
+        self._downlink_resampler = AudioResampler(
+            format="s16", layout="mono", rate=self._fmt.sample_rate
+        )
+        if name in {"pcma", "pcmu"}:
+            decoder_name = "pcm_alaw" if name == "pcma" else "pcm_mulaw"
+            self._decoder = av.CodecContext.create(decoder_name, "r")
+            self._decoder.sample_rate = codec.clock_rate
+            self._decoder.layout = "mono"
+            self._decoder.format = "s16"
+            self._encoder = av.CodecContext.create(decoder_name, "w")
+            self._encoder.sample_rate = codec.clock_rate
+            self._encoder.layout = "mono"
+            self._encoder.format = "s16"
+        elif name == "speex":
+            self._decoder = av.CodecContext.create("speex", "r")
+            self._decoder.sample_rate = codec.clock_rate
+            self._decoder.layout = "mono"
+            self._speex_pending = True
+        elif name == "opus":
+            self._decoder = av.CodecContext.create("opus", "r")
+            self._decoder.sample_rate = codec.clock_rate or 48000
+            try:
+                self._opus = OpusEncoder(sample_rate=self._fmt.sample_rate)
+            except Exception as err:  # noqa: BLE001 — optional native lib
+                _LOGGER.warning(
+                    "Opus negotiated but opuslib encoder unavailable (%s); "
+                    "silence/talkback uplink disabled for this call",
+                    err,
+                )
+        else:
+            raise MediaRuntimeError(f"Unsupported negotiated audio codec: {codec.name}")
         inbound_policy = pylibsrtp.Policy(
             key=media.crypto.key,
             ssrc_type=pylibsrtp.Policy.SSRC_ANY_INBOUND,
@@ -164,6 +213,53 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         )
         self._inbound = pylibsrtp.Session(inbound_policy)
         self._outbound = pylibsrtp.Session(outbound_policy)
+
+    async def prepare_encoders(self, ffmpeg_path: str | None = None) -> None:
+        """Start Speex ffmpeg encoder when that codec was negotiated."""
+        if not self._speex_pending or self._codec is None:
+            return
+        path = resolve_ffmpeg(ffmpeg_path)
+        if not path:
+            _LOGGER.error(
+                "Speex negotiated but ffmpeg was not found; "
+                "mic talkback disabled (canned silence keepalive still runs)"
+            )
+            self._speex_pending = False
+            return
+        encoder = SpeexFfmpegEncoder(
+            ffmpeg_path=path,
+            sample_rate=self._codec.clock_rate or 8000,
+            payload_type=self._codec.payload_type,
+        )
+        self._speex = encoder
+        try:
+            await encoder.start()
+        except Exception as err:  # noqa: BLE001
+            self._speex = None
+            with contextlib.suppress(Exception):
+                await encoder.close()
+            _LOGGER.error(
+                "Speex negotiated but ffmpeg libspeex encoder failed (%s); "
+                "mic talkback disabled (canned silence keepalive still runs)",
+                err,
+            )
+            self._speex_pending = False
+            return
+        self._speex_pending = False
+
+    @property
+    def talkback_encoder_ready(self) -> bool:
+        """True when unmuted mic frames can be encoded for the negotiated codec."""
+        if self._codec is None:
+            return False
+        name = self._codec.name.casefold()
+        if name in {"pcma", "pcmu"}:
+            return self._encoder is not None
+        if name == "opus":
+            return self._opus is not None
+        if name == "speex":
+            return self._speex is not None and self._speex.alive
+        return False
 
     def prime_remote(self) -> None:
         """Open a symmetric-NAT path with a STUN Binding Request, not a dummy byte."""
@@ -181,72 +277,181 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
             frames = self._decoder.decode(av.Packet(packet.payload))
         except (ValueError, pylibsrtp.Error, av.FFmpegError):
             return
+        delivered = False
         for frame in frames:
-            frame.sample_rate = self._codec.clock_rate
-            frame.pts = packet.timestamp
-            frame.time_base = Fraction(1, self._codec.clock_rate)
-            self.track.put(frame)
-        if frames:
+            for converted in self._prepare_downlink_frames(frame, packet.timestamp):
+                self.track.put(converted)
+                delivered = True
+        if delivered:
             self.media_received()
+
+    def _prepare_downlink_frames(
+        self, frame: av.AudioFrame, timestamp: int
+    ) -> list[av.AudioFrame]:
+        assert self._codec is not None
+        rate = self._fmt.sample_rate if self._fmt else self._codec.clock_rate
+        frames = [frame]
+        if self._downlink_resampler is not None:
+            try:
+                frames = list(self._downlink_resampler.resample(frame))
+            except (ValueError, av.FFmpegError):
+                frames = [frame]
+        out: list[av.AudioFrame] = []
+        for item in frames:
+            pcm = bytes(item.planes[0])[: item.samples * 2]
+            pcm = apply_gain_s16(pcm, self._gain_db)
+            samples = len(pcm) // 2
+            if samples <= 0:
+                continue
+            converted = av.AudioFrame(format="s16", layout="mono", samples=samples)
+            converted.sample_rate = rate
+            converted.planes[0].update(pcm)
+            converted.pts = timestamp
+            converted.time_base = Fraction(1, rate)
+            out.append(converted)
+        return out
 
     def set_microphone(self, enabled: bool) -> None:
         self._microphone_enabled = enabled
         if not enabled:
             self._pcm.clear()
+            self._speex_epoch += 1
+            chain, self._speex_chain = self._speex_chain, None
+            if chain is not None:
+                chain.cancel()
 
     def send_pcm(self, pcm: bytes) -> None:
-        if not self._microphone_enabled:
+        """Queue PCM for talkback; Speex frames are serialized on one task chain."""
+        if not self._microphone_enabled or self._codec is None or self._fmt is None:
             return
-        self._transmit_pcm(pcm)
+        self._pcm.extend(pcm)
+        name = self._codec.name.casefold()
+        frame_bytes = self._fmt.frame_bytes
+        while len(self._pcm) >= frame_bytes:
+            chunk = bytes(self._pcm[:frame_bytes])
+            del self._pcm[:frame_bytes]
+            if name in {"pcma", "pcmu"}:
+                try:
+                    self._transmit_g711(chunk)
+                except (ValueError, pylibsrtp.Error, av.FFmpegError):
+                    self.set_microphone(False)
+                    raise
+            elif name == "opus" and self._opus is not None:
+                try:
+                    payload = self._opus.encode(chunk)
+                except Exception:  # noqa: BLE001
+                    continue
+                self._send_payload(payload, samples=self._opus.frame_samples)
+            elif name == "speex":
+                if self._speex is None:
+                    # Encoder missing: keepalive continues silence; skip mic PCM.
+                    continue
+                prev = self._speex_chain
+                epoch = self._speex_epoch
 
-    def send_silence(self) -> None:
-        """Send one 20 ms G.711 silence frame without enabling the microphone."""
-        if self._microphone_enabled or self._codec is None:
+                async def _run(
+                    frame: bytes = chunk,
+                    prior: asyncio.Task[None] | None = prev,
+                    expected: int = epoch,
+                ) -> None:
+                    if prior is not None:
+                        with contextlib.suppress(Exception):
+                            await prior
+                    if not self._microphone_enabled or self._speex_epoch != expected:
+                        return
+                    await self._send_speex_pcm(frame, expected)
+
+                self._speex_chain = asyncio.create_task(_run())
+
+    async def send_silence(self) -> None:
+        """Send one 20 ms silence frame to keep the door's downlink open.
+
+        When the microphone is unmuted *and* a talkback encoder is ready, real
+        mic frames replace silence. If Speex/Opus encoding is unavailable,
+        keep sending silence even while the mic is "enabled" so listen does not
+        die when the user unmutes.
+        """
+        if self._codec is None or self._fmt is None:
             return
+        if self._microphone_enabled and self.talkback_encoder_ready:
+            return
+        name = self._codec.name.casefold()
         try:
-            self._transmit_pcm(bytes(self._codec.clock_rate // 50 * 2))
-        except (ValueError, pylibsrtp.Error, av.FFmpegError):
+            if name in {"pcma", "pcmu"}:
+                self._transmit_g711(bytes(self._fmt.frame_bytes))
+            elif name == "opus" and self._opus is not None:
+                self._send_payload(self._opus.encode_silence(), samples=self._opus.frame_samples)
+            elif name == "speex":
+                # Prefer canned 8 kHz Speex silence so the door opens downlink.
+                samples = self._fmt.frame_samples
+                payload = speex_silence_frame(self._codec.clock_rate or 8000)
+                if payload is None and self._speex is not None:
+                    payload = await self._speex.encode_silence()
+                if payload:
+                    self._send_payload(payload, samples=samples)
+        except (ValueError, pylibsrtp.Error, av.FFmpegError, OSError):
             return
 
-    def _transmit_pcm(self, pcm: bytes) -> None:
+    async def _send_speex_pcm(self, chunk: bytes, epoch: int) -> None:
+        if (
+            not self._microphone_enabled
+            or self._speex_epoch != epoch
+            or self._speex is None
+            or self._fmt is None
+        ):
+            return
+        payload = await self._speex.encode(chunk)
+        if payload and self._microphone_enabled and self._speex_epoch == epoch:
+            self._send_payload(payload, samples=self._fmt.frame_samples)
+
+    def _transmit_g711(self, chunk: bytes) -> None:
+        if self._codec is None or self._encoder is None:
+            return
+        samples = len(chunk) // 2
+        frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
+        frame.sample_rate = self._codec.clock_rate
+        frame.planes[0].update(chunk)
+        encoded = self._encoder.encode(frame)
+        if not encoded:
+            return
+        payload = b"".join(bytes(item) for item in encoded)
+        self._send_payload(payload, samples=samples)
+
+    def _send_payload(self, payload: bytes, *, samples: int) -> None:
         if (
             self._codec is None
-            or self._encoder is None
             or self._outbound is None
             or self._remote is None
             or self.transport is None
         ):
             return
-        self._pcm.extend(pcm)
-        packet_bytes = self._codec.clock_rate // 50 * 2  # 20 ms of mono s16
-        while len(self._pcm) >= packet_bytes:
-            chunk = bytes(self._pcm[:packet_bytes])
-            del self._pcm[:packet_bytes]
-            samples = len(chunk) // 2
-            frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
-            frame.sample_rate = self._codec.clock_rate
-            frame.planes[0].update(chunk)
-            try:
-                encoded = self._encoder.encode(frame)
-                if not encoded:
-                    continue
-                payload = b"".join(bytes(item) for item in encoded)
-                packet = RtpPacket(
-                    payload_type=self._codec.payload_type,
-                    marker=1 if self._first_packet else 0,
-                    sequence_number=self._sequence,
-                    timestamp=self._timestamp,
-                    ssrc=self._ssrc,
-                    payload=payload,
-                )
-                protected = self._outbound.protect(packet.serialize())
-            except (ValueError, pylibsrtp.Error, av.FFmpegError):
-                self.set_microphone(False)
-                raise
-            self.transport.sendto(protected, self._remote)
-            self._first_packet = False
-            self._sequence = (self._sequence + 1) & 0xFFFF
-            self._timestamp = (self._timestamp + samples) & 0xFFFFFFFF
+        packet = RtpPacket(
+            payload_type=self._codec.payload_type,
+            marker=1 if self._first_packet else 0,
+            sequence_number=self._sequence,
+            timestamp=self._timestamp,
+            ssrc=self._ssrc,
+            payload=payload,
+        )
+        try:
+            protected = self._outbound.protect(packet.serialize())
+        except (ValueError, pylibsrtp.Error):
+            return
+        self.transport.sendto(protected, self._remote)
+        self._first_packet = False
+        self._sequence = (self._sequence + 1) & 0xFFFF
+        self._timestamp = (self._timestamp + samples) & 0xFFFFFFFF
+
+    async def aclose_encoders(self) -> None:
+        # Bump epoch first so in-flight chain tasks exit without another encode.
+        self._speex_epoch += 1
+        chain, self._speex_chain = self._speex_chain, None
+        if chain is not None:
+            chain.cancel()
+            await asyncio.gather(chain, return_exceptions=True)
+        speex, self._speex = self._speex, None
+        if speex is not None:
+            await speex.close()
 
     def close(self) -> None:
         self.set_microphone(False)
@@ -270,7 +475,7 @@ class _StunResponderProtocol(asyncio.DatagramProtocol):
 
 
 class MediaRuntime:
-    """Own one FFmpeg video receiver and one Python G.711 SRTP transport."""
+    """Own one FFmpeg video receiver and one Python SRTP audio transport."""
 
     def __init__(
         self,
@@ -279,10 +484,12 @@ class MediaRuntime:
         event_callback: EventCallback,
         *,
         allocate_generation: Callable[[], int] | None = None,
+        audio_gain_db: float = DEFAULT_AUDIO_GAIN_DB,
     ) -> None:
         self.sip = sip
         self.ffmpeg_binary = ffmpeg_binary
         self.event_callback = event_callback
+        self.audio_gain_db = float(audio_gain_db)
         self.process: asyncio.subprocess.Process | None = None
         self.audio: AudioRtpProtocol | None = None
         self.audio_track: AudioReceiveTrack | None = None
@@ -308,6 +515,13 @@ class MediaRuntime:
         self._local_generation_seq = 0
         self.media_generation = 0
         self.sip.on_call_end = self.remote_ended
+
+    @property
+    def talkback_sample_rate(self) -> int:
+        """PCM sample rate expected by the negotiated uplink codec."""
+        if self.audio and self.audio._fmt is not None:
+            return self.audio._fmt.sample_rate
+        return 8000
 
     def _next_media_generation(self) -> int:
         if self._allocate_generation is not None:
@@ -364,7 +578,8 @@ class MediaRuntime:
             answer = await self.sip.start_monitoring(offer.sdp)
             session = parse_answer(answer, offer)
             self.negotiated = session
-            self.audio.configure(session)
+            self.audio.configure(session, gain_db=self.audio_gain_db)
+            await self.audio.prepare_encoders(self.ffmpeg_binary)
             self.audio.prime_remote()
             if session.audio:
                 rtcp_transport.sendto(
@@ -434,13 +649,12 @@ class MediaRuntime:
             self._monitor = asyncio.create_task(self._watchdog())
             self._primer = asyncio.create_task(self._prime_relay())
             self._keepalive = asyncio.create_task(self._audio_keepalive())
+            negotiated_audio = select_audio_codec(session.audio) if session.audio else None
             await self.event_callback(
                 {
                     "event": "media_format",
                     "video": "H264",
-                    "audio": session.audio.codec({"pcma", "pcmu"}).name
-                    if session.audio and session.audio.codec({"pcma", "pcmu"})
-                    else None,
+                    "audio": negotiated_audio.name if negotiated_audio else None,
                 }
             )
         except Exception:
@@ -484,7 +698,7 @@ class MediaRuntime:
             self.audio.send_pcm(pcm)
 
     def _audio_received(self) -> None:
-        """Inbound G.711 RTP — must not alone satisfy video readiness/watchdog."""
+        """Inbound audio RTP — must not alone satisfy video readiness/watchdog."""
         if not self._last_audio:
             _LOGGER.warning("BTicino inbound audio RTP received")
         self._last_audio = time.monotonic()
@@ -566,18 +780,22 @@ class MediaRuntime:
             raise
 
     async def _audio_keepalive(self) -> None:
-        """Send view-only G.711 silence so the relay latches return audio, like Door Entry."""
+        """Send Speex/G.711 silence so the door opens downlink, like Door Entry.
+
+        Continues while the mic is muted, and also while unmuted if talkback
+        encoding is unavailable (so listen is not killed by a failed Speex
+        encoder). ``send_silence`` itself skips when real mic frames can flow.
+        """
         try:
             while not self._ending:
                 session = self.negotiated
                 if (
-                    not self.microphone_enabled
-                    and self.audio
+                    self.audio
                     and session
                     and session.audio
                     and session.audio.direction in {"sendrecv", "recvonly"}
                 ):
-                    self.audio.send_silence()
+                    await self.audio.send_silence()
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
             raise
@@ -615,6 +833,7 @@ class MediaRuntime:
                     process.kill()
                     await process.wait()
             if self.audio:
+                await self.audio.aclose_encoders()
                 self.audio.close()
                 self.audio = None
                 self.audio_track = None
