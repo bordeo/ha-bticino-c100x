@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.9 — 2026-11-20
+
+- **Second-call video/mic stuck on “changing”:** Open MediaPlayer as soon as SIP media starts (`prime`) so it can catch the first H.264 IDR from the UDP loopback relay. If no frame arrives before the WebRTC answer, reopen the player once to resync. Avoids the card’s 10 s `watchStream` timeout after a missed keyframe with no PLI/FIR.
+- **Faster ICE:** When TURN is configured, skip STUN on the aiortc side (host + TURN only) so gather is not stalled ~5 s by blocked STUN. Card ICE gather timeout reduced to 2.5 s.
+- **Speex load:** Prefer the vendored `libspeex` path first, never call `ctypes.util.find_library` (Alpine probes blocked the event loop). Cache the handle; construct the encoder via `asyncio.to_thread`.
+- **WebRTC peer close identity:** `close(session_id, peer=…)` only tears down that peer instance, so a reused HA `session_id` cannot close a newer connection.
+- Echo-cancellation (speexdsp AEC) not added in this release (optional, off-by-default) — deferred until a cheap/safe path is clear.
+
 ## 0.3.8 — 2026-11-20
 
 - **Mic talkback without ffmpeg libspeex:** Home Assistant’s Alpine ffmpeg build does not include Speex, so v0.3.7 silence keepalive worked but unmuted mic frames were dropped. Add an in-process Speex encoder (ctypes + vendored `libspeex` for musl/gnu × x86_64/aarch64; system `libspeex` preferred when present). Prefer native encoder; keep ffmpeg Speex as fallback. Log which encoder is used; disable talkback only if both fail. Canned Speex silence remains for muted keepalive.

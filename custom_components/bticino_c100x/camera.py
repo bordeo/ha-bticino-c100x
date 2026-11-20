@@ -79,6 +79,9 @@ class C100XCamera(C100XEntity, Camera):
                 if session is not None
                 else 0
             )
+            # Open MediaPlayer immediately so it can catch the first H.264 IDR
+            # from the loopback relay before createAnswer.
+            await self._bridge.prime(generation)
             answer = await self._bridge.answer(
                 session_id, offer_sdp, media_generation=generation
             )

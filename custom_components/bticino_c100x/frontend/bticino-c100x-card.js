@@ -17,7 +17,8 @@ function newOwnerId() {
 }
 
 const START_TIMEOUT_MS = 30000;
-const ICE_GATHER_TIMEOUT_MS = 8000;
+// Host + TURN gather quickly; do not wait for a blocked STUN transaction.
+const ICE_GATHER_TIMEOUT_MS = 2500;
 const LIVE_STATES = new Set(["streaming"]);
 const ENDED_STATES = new Set(["idle", "error", "unavailable"]);
 

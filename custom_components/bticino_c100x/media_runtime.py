@@ -223,8 +223,11 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
             return
         rate = self._codec.clock_rate or 8000
         # 1) In-process ctypes Speex (works on HA Alpine where ffmpeg lacks libspeex).
+        # Construction loads the shared library — always off the event loop.
         try:
-            native = SpeexNativeEncoder(sample_rate=rate, quality=8, vbr=True)
+            native = await asyncio.to_thread(
+                SpeexNativeEncoder, sample_rate=rate, quality=8, vbr=True
+            )
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "In-process Speex encoder unavailable (%s); trying ffmpeg libspeex",

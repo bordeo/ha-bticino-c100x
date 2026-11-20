@@ -87,8 +87,10 @@ def test_rtc_configuration_adds_relay_for_aiortc() -> None:
     assert [s.urls for s in plain.iceServers] == [cfg.SERVER_STUN_URL]
     turn = SimpleNamespace(urls=["turn:turn.cloudflare.com:3478?transport=udp"], username="u", credential="c")
     relayed = webrtc.rtc_configuration([turn])
-    assert relayed.iceServers[1].username == "u"
-    assert relayed.iceServers[1].urls[0].startswith("turn:")
+    # TURN present → skip STUN (aioice STUN retries often stall ~5s on CGNAT).
+    assert len(relayed.iceServers) == 1
+    assert relayed.iceServers[0].username == "u"
+    assert relayed.iceServers[0].urls[0].startswith("turn:")
 
     # aiortc must accept it and translate it into aioice TURN settings.
     from aiortc.rtcicetransport import connection_kwargs
@@ -112,9 +114,9 @@ def test_microphone_uplink_uses_rtc_configuration_with_turn() -> None:
     from custom_components.bticino_c100x.webrtc import rtc_configuration
 
     config = rtc_configuration(uplink._ice_servers())
-    assert len(config.iceServers) == 2
-    assert config.iceServers[1].username == "u"
-    assert "turn:" in config.iceServers[1].urls[0]
+    assert len(config.iceServers) == 1
+    assert config.iceServers[0].username == "u"
+    assert "turn:" in config.iceServers[0].urls[0]
 
 
 def test_read_turn_file_missing_returns_none(tmp_path: Path) -> None:

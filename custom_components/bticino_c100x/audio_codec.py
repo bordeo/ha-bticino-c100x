@@ -183,33 +183,53 @@ def _vendor_libspeex_path() -> Path | None:
     return None
 
 
+_libspeex_cache: ctypes.CDLL | None = None
+_libspeex_error: BaseException | None = None
+
+
 def _load_libspeex() -> ctypes.CDLL:
-    """Load libspeex: system library first, then vendored musl/gnu builds."""
+    """Load libspeex once: vendored path first, then a few direct sonames.
+
+    Prefer the integration's vendored ``.so`` so Home Assistant Alpine does not
+    burn seconds in ``ctypes.util.find_library`` / ldconfig probes that never
+    find Speex. Cache the handle (or the failure) for the process lifetime.
+    """
+    global _libspeex_cache, _libspeex_error
+    if _libspeex_cache is not None:
+        return _libspeex_cache
+    if _libspeex_error is not None:
+        raise OSError(str(_libspeex_error)) from _libspeex_error
+
     errors: list[str] = []
-    for candidate in (
-        "libspeex.so.1",
-        "libspeex.so",
-        "speex",
-    ):
-        try:
-            if candidate == "speex":
-                found = ctypes.util.find_library("speex")
-                if not found:
-                    continue
-                return ctypes.CDLL(found)
-            return ctypes.CDLL(candidate)
-        except OSError as err:
-            errors.append(f"{candidate}: {err}")
     vendored = _vendor_libspeex_path()
     if vendored is not None:
         try:
-            return ctypes.CDLL(str(vendored))
+            _libspeex_cache = ctypes.CDLL(str(vendored))
+            return _libspeex_cache
         except OSError as err:
             errors.append(f"{vendored}: {err}")
-    raise OSError(
-        "libspeex not available (HA ffmpeg has no Speex; tried system + vendored): "
+
+    # Direct soname opens only — never find_library() (blocks the event loop on
+    # Alpine with repeated open('/lib/speex') style probes).
+    for candidate in ("libspeex.so.1", "libspeex.so"):
+        try:
+            _libspeex_cache = ctypes.CDLL(candidate)
+            return _libspeex_cache
+        except OSError as err:
+            errors.append(f"{candidate}: {err}")
+
+    _libspeex_error = OSError(
+        "libspeex not available (HA ffmpeg has no Speex; tried vendored + soname): "
         + "; ".join(errors)
     )
+    raise _libspeex_error
+
+
+def reset_libspeex_cache_for_tests() -> None:
+    """Clear the process-wide libspeex cache (unit tests only)."""
+    global _libspeex_cache, _libspeex_error
+    _libspeex_cache = None
+    _libspeex_error = None
 
 
 class SpeexNativeEncoder:
