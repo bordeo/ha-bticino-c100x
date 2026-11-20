@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.3.4 — unreleased
+## 0.3.4 — 2026-11-20
 
-- Optional TURN relay for viewing from outside the home network (CGNAT home + cellular phone). Configure `bticino_c100x: cloudflare_turn_key_id` / `cloudflare_turn_api_token` (via `!secret`). Short-lived Cloudflare Realtime TURN credentials are minted and refreshed, registered with Home Assistant's WebRTC ICE servers for browsers, and used by the aiortc side as a relay candidate. Without the YAML keys nothing changes.
+- Optional TURN relay for viewing from outside the home network (CGNAT home + cellular phone). Configure `bticino_c100x: cloudflare_turn_key_id` / `cloudflare_turn_api_token` (via `!secret`). Short-lived Cloudflare Realtime TURN credentials are minted and refreshed, registered with Home Assistant's WebRTC ICE servers for browsers, and used by the aiortc side as a relay candidate. Without the YAML keys nothing changes. The YAML block is validated (both keys or neither); the TURN key is only ever sent to `rtc.live.cloudflare.com` and is never logged.
 
 ## 0.3.3 — 2026-11-10
 

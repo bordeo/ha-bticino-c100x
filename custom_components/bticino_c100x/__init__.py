@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
+import voluptuous as vol
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.lovelace.const import LOVELACE_DATA, MODE_STORAGE
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.storage import Store
 
@@ -24,6 +26,19 @@ from .media_runtime import MediaRuntimeError
 from .sip import SipError
 from .turn import async_setup_turn
 from .websocket import async_register as async_register_websocket
+
+# Devices come from config entries; YAML only carries the optional TURN key.
+CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Optional(DOMAIN): vol.Schema(
+            {
+                vol.Inclusive("cloudflare_turn_key_id", "cloudflare_turn"): cv.string,
+                vol.Inclusive("cloudflare_turn_api_token", "cloudflare_turn"): cv.string,
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 CARD_PATH = Path(__file__).parent / "frontend" / "bticino-c100x-card.js"
 CARD_STATIC_URL = "/bticino_c100x/bticino-c100x-card.js"
