@@ -15,6 +15,7 @@ from aiortc import (
     RTCBundlePolicy,
     RTCConfiguration,
     RTCIceServer,
+    RTCIceTransportPolicy,
     RTCPeerConnection,
     RTCSessionDescription,
 )
@@ -25,6 +26,8 @@ from .webrtc_config import SERVER_STUN_URL, aiortc_turn_entry
 
 _LOGGER = logging.getLogger(__name__)
 PLAYER_GRACE_SECONDS = 10
+# Wait for MediaPlayer to decode at least one frame (next IDR) before answering.
+PLAYER_FIRST_FRAME_TIMEOUT = 3.0
 
 
 class _SnapshotTrack(MediaStreamTrack):
@@ -78,6 +81,8 @@ class WebRTCBridge:
         self.snapshot_path = snapshot_path
         self._player: MediaPlayer | None = None
         self._player_generation: int | None = None
+        self._player_got_frame = False
+        self._player_frame_event = asyncio.Event()
         self._video_source: MediaStreamTrack | None = None
         self._relay = MediaRelay()
         self._peers: dict[str, RTCPeerConnection] = {}
@@ -90,6 +95,19 @@ class WebRTCBridge:
         """Register a browser session before the slower SIP setup begins."""
         self._pending_candidates.setdefault(session_id, [])
 
+    async def prime(self, media_generation: int) -> None:
+        """Open MediaPlayer as soon as playback.sdp exists (before the answer).
+
+        The door often emits the first IDR ~100–200 ms after the loopback relay
+        starts; opening the player only inside ``answer()`` misses it and the
+        browser then waits for a later keyframe (card watchStream times out).
+        """
+        async with self._lock:
+            if self._cleanup_task:
+                self._cleanup_task.cancel()
+                self._cleanup_task = None
+            await self._ensure_player(media_generation, force=False)
+
     async def answer(
         self, session_id: str, offer_sdp: str, *, media_generation: int
     ) -> str:
@@ -97,7 +115,29 @@ class WebRTCBridge:
             if self._cleanup_task:
                 self._cleanup_task.cancel()
                 self._cleanup_task = None
-            await self._ensure_player(media_generation)
+            # Identity-safe: drop only this session's prior peer (HA may reuse ids).
+            # Do not clear _pending_candidates here — ICE may already be queued.
+            existing = self._peers.pop(session_id, None)
+            if existing is not None:
+                await existing.close()
+                self.viewer_changed(-1)
+            # Prefer a primed player (opened right after SIP media starts). Reopen
+            # only when generation changed or the open still has no decoded frame
+            # after waiting — rebinding too early can miss the next IDR again.
+            if (
+                self._player is None
+                or self._player_generation != media_generation
+            ):
+                await self._ensure_player(media_generation, force=True)
+            await self._wait_for_player_frame_unlocked(PLAYER_FIRST_FRAME_TIMEOUT)
+            if not self._player_got_frame:
+                _LOGGER.warning(
+                    "BTicino WebRTC reopening MediaPlayer to resync H.264 after "
+                    "missed keyframe"
+                )
+                await self._ensure_player(media_generation, force=True)
+                await self._wait_for_player_frame_unlocked(PLAYER_FIRST_FRAME_TIMEOUT)
+
             peer = RTCPeerConnection(
                 _rtc_configuration(self.ice_servers() if self.ice_servers else None)
             )
@@ -110,7 +150,8 @@ class WebRTCBridge:
                     "BTicino WebRTC connection state: %s", peer.connectionState
                 )
                 if peer.connectionState in {"failed", "closed", "disconnected"}:
-                    await self.close(session_id)
+                    # Pass the peer object so a reused session_id cannot close a newer PC.
+                    await self.close(session_id, peer=peer)
 
             @peer.on("iceconnectionstatechange")
             async def ice_connection_state_changed() -> None:
@@ -144,9 +185,11 @@ class WebRTCBridge:
                 )
                 return peer.localDescription.sdp
             except Exception:
-                self._peers.pop(session_id, None)
-                self._pending_candidates.pop(session_id, None)
-                self.viewer_changed(-1)
+                current = self._peers.get(session_id)
+                if current is peer:
+                    self._peers.pop(session_id, None)
+                    self._pending_candidates.pop(session_id, None)
+                    self.viewer_changed(-1)
                 await peer.close()
                 if not self._peers:
                     self._schedule_player_cleanup()
@@ -187,16 +230,27 @@ class WebRTCBridge:
         candidate.sdpMLineIndex = getattr(value, "sdp_m_line_index", None)
         await peer.addIceCandidate(candidate)
 
-    async def close(self, session_id: str) -> None:
+    async def close(
+        self, session_id: str, peer: RTCPeerConnection | None = None
+    ) -> None:
         async with self._lock:
-            self._pending_candidates.pop(session_id, None)
-            peer = self._peers.pop(session_id, None)
-            if peer is None:
-                return
-            await peer.close()
-            self.viewer_changed(-1)
-            if not self._peers:
-                self._schedule_player_cleanup()
+            await self._close_peer_unlocked(session_id, expected=peer)
+
+    async def _close_peer_unlocked(
+        self, session_id: str, *, expected: RTCPeerConnection | None
+    ) -> None:
+        """Close ``session_id`` only if it still maps to ``expected`` (when given)."""
+        self._pending_candidates.pop(session_id, None)
+        current = self._peers.get(session_id)
+        if current is None:
+            return
+        if expected is not None and current is not expected:
+            return
+        self._peers.pop(session_id, None)
+        await current.close()
+        self.viewer_changed(-1)
+        if not self._peers:
+            self._schedule_player_cleanup()
 
     async def close_all(self) -> None:
         for session_id in tuple(self._peers):
@@ -207,7 +261,7 @@ class WebRTCBridge:
                 self._cleanup_task = None
             await self._cleanup_player_locked()
 
-    async def _ensure_player(self, media_generation: int) -> None:
+    async def _ensure_player(self, media_generation: int, *, force: bool = False) -> None:
         """Open (or reopen) MediaPlayer for an explicit runtime media generation.
 
         Fingerprint/content alone is insufficient: loopback RTP ports can repeat,
@@ -216,12 +270,19 @@ class WebRTCBridge:
         after ``start_monitoring`` has written ``playback.sdp``. Generations are
         allocated by the entry manager so SIP reconnect (new MediaRuntime, same
         camera WebRTCBridge) cannot reuse a prior numeric id.
+
+        ``force=True`` always opens a fresh player (next IDR), used when the
+        previous open missed the first keyframe or a new answer needs a resync.
         """
         if media_generation <= 0:
             raise RuntimeError("Media channel generation is not ready")
-        if self._player is not None and self._player_generation == media_generation:
+        if (
+            not force
+            and self._player is not None
+            and self._player_generation == media_generation
+        ):
             return
-        # Generation change: drop peers still holding subscriptions to old tracks.
+        # Generation change / force: drop peers still holding old track subscriptions.
         await self._retire_all_peers_locked()
         await self._cleanup_player_locked()
         for _ in range(100):
@@ -244,6 +305,8 @@ class WebRTCBridge:
                 await asyncio.sleep(0.1)
                 continue
             self._player_generation = media_generation
+            self._player_got_frame = False
+            self._player_frame_event = asyncio.Event()
             self._video_source = self._player.video
             if self._video_source and self.snapshot_path:
                 self._video_source = _SnapshotTrack(
@@ -255,6 +318,19 @@ class WebRTCBridge:
                 )
             return
         raise RuntimeError("Media channel did not become ready")
+
+    async def _wait_for_player_frame_unlocked(self, timeout: float) -> None:
+        """Block until keepalive decoded one frame, or ``timeout`` elapses."""
+        if self._player_got_frame:
+            return
+        try:
+            await asyncio.wait_for(self._player_frame_event.wait(), timeout=timeout)
+        except TimeoutError:
+            _LOGGER.warning(
+                "BTicino WebRTC MediaPlayer got no frame within %.1fs "
+                "(browser may wait for the next H.264 IDR)",
+                timeout,
+            )
 
     async def _retire_all_peers_locked(self) -> None:
         """Close every peer under the bridge lock (caller already holds ``_lock``)."""
@@ -272,6 +348,9 @@ class WebRTCBridge:
         try:
             while True:
                 await track.recv()
+                if not self._player_got_frame:
+                    self._player_got_frame = True
+                    self._player_frame_event.set()
         finally:
             track.stop()
 
@@ -301,6 +380,8 @@ class WebRTCBridge:
                 self._player.audio.stop()
         self._player = None
         self._player_generation = None
+        self._player_got_frame = False
+        self._player_frame_event = asyncio.Event()
         self._video_source = None
         # Fresh relay so old track subscriptions cannot be reused.
         self._relay = MediaRelay()
@@ -314,22 +395,30 @@ def _candidate_summary(sdp: str) -> str:
 
 
 def rtc_configuration(ice_servers=None) -> RTCConfiguration:
-    """STUN (+ optional TURN) for video and microphone uplink peers.
+    """Build ICE config: always gather host; TURN is optional.
 
-    When Home Assistant has a credentialed TURN server registered, also gather
-    a relay candidate so a CGNAT home and a cellular phone can still connect.
+    - No TURN key → STUN only (LAN / same-network viewing still works).
+    - TURN configured → TURN in ``iceServers`` and **skip STUN** so aioice is
+      not stalled ~5s by blocked STUN on CGNAT. This is **host + TURN**, never
+      relay-only: ``iceTransportPolicy`` stays ``all`` so local host candidates
+      are always gathered for the home LAN.
     """
-    servers = [RTCIceServer(urls=SERVER_STUN_URL)]
     turn = aiortc_turn_entry(ice_servers)
     if turn:
-        servers.append(
+        servers = [
             RTCIceServer(
                 urls=turn["urls"],
                 username=turn["username"],
                 credential=turn["credential"],
             )
-        )
-    return RTCConfiguration(iceServers=servers, bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
+        ]
+    else:
+        servers = [RTCIceServer(urls=SERVER_STUN_URL)]
+    return RTCConfiguration(
+        iceServers=servers,
+        iceTransportPolicy=RTCIceTransportPolicy.ALL,
+        bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
+    )
 
 
 # Back-compat for tests/imports that used the private name.
