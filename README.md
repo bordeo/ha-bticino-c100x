@@ -46,6 +46,32 @@ protocol and behaviour, with media/doorbell/card fixes described in
 Requirements: Home Assistant with `ffmpeg`, outbound HTTPS to Legrand/Eliot, and
 UDP reachability for SIP/media (same network expectations as the mobile app).
 
+## Optional TURN (remote viewing)
+
+For WebRTC viewing from outside the home network (CGNAT + cellular), configure
+a Cloudflare Realtime TURN key. Prefer secrets — never commit tokens.
+
+**Option A — `configuration.yaml`** (takes precedence):
+
+```yaml
+bticino_c100x:
+  cloudflare_turn_key_id: !secret cloudflare_turn_key_id
+  cloudflare_turn_api_token: !secret cloudflare_turn_api_token
+```
+
+**Option B — `bticino_turn.yaml`** in the Home Assistant config directory
+(useful when `configuration.yaml` is not writable). Same two keys, no wrapping
+`bticino_c100x:` block:
+
+```yaml
+cloudflare_turn_key_id: "..."
+cloudflare_turn_api_token: "..."
+```
+
+If the file is missing, behaviour matches a install without TURN. If present
+but malformed, a warning is logged (values never printed) and TURN is skipped.
+Restart Home Assistant after changing either location.
+
 ## Entities
 
 | Type | Name | Notes |

@@ -3,26 +3,33 @@
 Both the Peraga WAN (CGNAT) and a phone on cellular are behind NATs that
 usually block a direct host/srflx ICE path, so remote WebRTC needs a relay.
 Cloudflare TURN credentials are short-lived: a long-term TURN key (kept in
-secrets.yaml) mints them, and we cache and refresh them here. The servers are
-registered with Home Assistant's web_rtc registry so browsers receive them via
-the camera client configuration, and the aiortc side uses them too.
+``configuration.yaml`` under ``bticino_c100x:`` or in ``bticino_turn.yaml``)
+mints them, and we cache and refresh them here. The servers are registered
+with Home Assistant's web_rtc registry so browsers receive them via the
+camera client configuration, and the aiortc side uses them too.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 from homeassistant.components.web_rtc import async_register_ice_servers
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util.yaml import load_yaml
 from webrtc_models import RTCIceServer
 
 from .webrtc_config import turn_servers_from_cloudflare
 
 _LOGGER = logging.getLogger(__name__)
+
+TURN_FILE_NAME = "bticino_turn.yaml"
+CONF_TURN_KEY_ID = "cloudflare_turn_key_id"
+CONF_TURN_API_TOKEN = "cloudflare_turn_api_token"
 
 CF_GENERATE_URL = (
     "https://rtc.live.cloudflare.com/v1/turn/keys/{key_id}"
@@ -90,13 +97,70 @@ class CloudflareTurn:
         ]
 
 
+def _nonempty_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _read_turn_file(path: Path) -> dict[str, str] | None:
+    """Load TURN credentials from ``bticino_turn.yaml``.
+
+    Returns ``None`` when the file is missing (same as no TURN configured).
+    Raises ``ValueError`` when the file exists but is malformed — callers must
+    warn without logging key/token values.
+    """
+    if not path.is_file():
+        return None
+    try:
+        data = load_yaml(path)
+    except Exception as err:  # noqa: BLE001 - treat any parse failure as malformed
+        raise ValueError(f"unreadable or invalid YAML ({err.__class__.__name__})") from err
+    if not isinstance(data, dict):
+        raise ValueError("expected a mapping with TURN keys")
+    key_id = _nonempty_str(data.get(CONF_TURN_KEY_ID))
+    api_token = _nonempty_str(data.get(CONF_TURN_API_TOKEN))
+    if key_id is None or api_token is None:
+        raise ValueError(
+            f"requires non-empty {CONF_TURN_KEY_ID} and {CONF_TURN_API_TOKEN}"
+        )
+    return {CONF_TURN_KEY_ID: key_id, CONF_TURN_API_TOKEN: api_token}
+
+
+async def _async_resolve_turn_credentials(
+    hass: HomeAssistant, conf: dict[str, Any]
+) -> tuple[str, str] | None:
+    """Resolve TURN key id + token: YAML block first, then ``bticino_turn.yaml``."""
+    key_id = _nonempty_str(conf.get(CONF_TURN_KEY_ID))
+    api_token = _nonempty_str(conf.get(CONF_TURN_API_TOKEN))
+    if key_id and api_token:
+        return key_id, api_token
+
+    path = Path(hass.config.path(TURN_FILE_NAME))
+    try:
+        file_conf = await hass.async_add_executor_job(_read_turn_file, path)
+    except ValueError as err:
+        # File present but bad — never log values.
+        _LOGGER.warning(
+            "BTicino TURN file %s is malformed (%s); continuing without TURN",
+            TURN_FILE_NAME,
+            err,
+        )
+        return None
+    if file_conf is None:
+        return None
+    _LOGGER.debug("TURN credentials loaded from %s", TURN_FILE_NAME)
+    return file_conf[CONF_TURN_KEY_ID], file_conf[CONF_TURN_API_TOKEN]
+
+
 async def async_setup_turn(hass: HomeAssistant, conf: dict[str, Any]) -> None:
-    """Register Cloudflare TURN when configured in YAML; never fail setup."""
-    key_id = conf.get("cloudflare_turn_key_id")
-    api_token = conf.get("cloudflare_turn_api_token")
-    if not key_id or not api_token:
+    """Register Cloudflare TURN when configured; never fail setup."""
+    resolved = await _async_resolve_turn_credentials(hass, conf)
+    if resolved is None:
         return
-    turn = CloudflareTurn(hass, str(key_id), str(api_token))
+    key_id, api_token = resolved
+    turn = CloudflareTurn(hass, key_id, api_token)
     try:
         await turn.async_refresh()
     except Exception as err:  # noqa: BLE001

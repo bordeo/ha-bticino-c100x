@@ -27,7 +27,8 @@ from .sip import SipError
 from .turn import async_setup_turn
 from .websocket import async_register as async_register_websocket
 
-# Devices come from config entries; YAML only carries the optional TURN key.
+# Devices come from config entries; YAML may carry optional TURN keys
+# (alternatively: config/bticino_turn.yaml — see turn.py).
 CONFIG_SCHEMA = vol.Schema(
     {
         vol.Optional(DOMAIN): vol.Schema(
@@ -57,7 +58,7 @@ CARD_URL = CARD_STATIC_URL
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register private APIs and the card asset once."""
     async_register_websocket(hass)
-    # Optional YAML: bticino_c100x: {cloudflare_turn_key_id, cloudflare_turn_api_token}
+    # Optional TURN: bticino_c100x YAML block, else config/bticino_turn.yaml.
     await async_setup_turn(hass, config.get(DOMAIN) or {})
     if hass.http:
         await hass.http.async_register_static_paths(
