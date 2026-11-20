@@ -46,31 +46,64 @@ protocol and behaviour, with media/doorbell/card fixes described in
 Requirements: Home Assistant with `ffmpeg`, outbound HTTPS to Legrand/Eliot, and
 UDP reachability for SIP/media (same network expectations as the mobile app).
 
-## Optional TURN (remote viewing)
+## Remote access (mobile data) / TURN
 
-For WebRTC viewing from outside the home network (CGNAT + cellular), configure
-a Cloudflare Realtime TURN key. Prefer secrets — never commit tokens.
+Many home internet connections and all mobile networks sit behind **CGNAT**:
+your phone and Home Assistant cannot open a direct WebRTC path to each other,
+so video and microphone stall even though local Wi‑Fi works. A **TURN relay**
+fixes that: when host/srflx ICE fails, media is relayed through Cloudflare.
+No ports need opening on your router. Relay is used only when a direct path
+fails. Short-lived credentials are minted from your TURN key and refreshed
+automatically; the long-term API token never goes to the browser.
 
-**Option A — `configuration.yaml`** (takes precedence):
+### Create a Cloudflare Realtime TURN key
 
-```yaml
-bticino_c100x:
-  cloudflare_turn_key_id: !secret cloudflare_turn_key_id
-  cloudflare_turn_api_token: !secret cloudflare_turn_api_token
-```
+1. Sign in to the [Cloudflare dashboard](https://dash.cloudflare.com/).
+2. Open **Realtime** → **TURN Server** (or Realtime → TURN).
+3. Choose **Create key**.
+4. Copy the **Key ID** and the **API token**. The token is shown **only once** —
+   store it in a password manager (never commit it to git).
 
-**Option B — `bticino_turn.yaml`** in the Home Assistant config directory
-(useful when `configuration.yaml` is not writable). Same two keys, no wrapping
-`bticino_c100x:` block:
+Docs: [Cloudflare Realtime TURN](https://developers.cloudflare.com/realtime/turn/)
+and [Generate credentials](https://developers.cloudflare.com/realtime/turn/generate-credentials/).
 
-```yaml
-cloudflare_turn_key_id: "..."
-cloudflare_turn_api_token: "..."
-```
+### Pricing (Cloudflare)
 
-If the file is missing, behaviour matches a install without TURN. If present
-but malformed, a warning is logged (values never printed) and TURN is skipped.
-Restart Home Assistant after changing either location.
+Per Cloudflare’s current docs
+([TURN Service](https://developers.cloudflare.com/realtime/turn/)):
+Realtime TURN is **free when used together with the Realtime SFU**; otherwise
+it costs **$0.05 per real-time GB outbound** from Cloudflare to the TURN client.
+Confirm the latest figures on that page before relying on them.
+
+### Configure in this integration
+
+**Preferred — integration options** (Settings → Devices & services →
+**BTicino C100X** → Configure). Enter **Cloudflare TURN key ID** and
+**Cloudflare TURN API token** (password field). Saving reloads the entry and
+refreshes ICE servers. You can also set these on first setup (optional step).
+
+**Alternatives** (lower precedence than options):
+
+1. `configuration.yaml`:
+
+   ```yaml
+   bticino_c100x:
+     cloudflare_turn_key_id: !secret cloudflare_turn_key_id
+     cloudflare_turn_api_token: !secret cloudflare_turn_api_token
+   ```
+
+2. `bticino_turn.yaml` in the HA config directory (when `configuration.yaml`
+   is not writable):
+
+   ```yaml
+   cloudflare_turn_key_id: "..."
+   cloudflare_turn_api_token: "..."
+   ```
+
+**Precedence:** integration options → YAML block → `bticino_turn.yaml`.
+Missing file/empty options → same as no TURN. Malformed file → warning (values
+never logged) and continue without TURN. With TURN configured, both the camera
+stream and the card microphone uplink use relay candidates.
 
 ## Entities
 

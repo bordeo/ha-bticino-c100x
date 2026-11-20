@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription
 from av.audio.resampler import AudioResampler
 
 from .media_session import MediaSession
-from .webrtc_config import SERVER_STUN_URL
+from .webrtc import rtc_configuration
 
 
 class MicrophoneUplink:
     """Receive browser audio and forward bounded PCM frames to SRTP."""
 
-    def __init__(self, session: MediaSession) -> None:
+    def __init__(
+        self,
+        session: MediaSession,
+        ice_servers: Callable[[], Any] | None = None,
+    ) -> None:
         self.session = session
+        self._ice_servers = ice_servers or (lambda: None)
         self.owner: str | None = None
         self.peer: RTCPeerConnection | None = None
         self._task: asyncio.Task[None] | None = None
@@ -30,9 +36,9 @@ class MicrophoneUplink:
             await self._close_locked()
             self.owner = owner
             self._track_ready.clear()
-            peer = RTCPeerConnection(
-                RTCConfiguration(iceServers=[RTCIceServer(urls=SERVER_STUN_URL)])
-            )
+            # Same STUN + optional Cloudflare TURN as the video peer so a
+            # CGNAT phone can relay mic RTP when host/srflx paths fail.
+            peer = RTCPeerConnection(rtc_configuration(self._ice_servers()))
             self.peer = peer
 
             @peer.on("track")

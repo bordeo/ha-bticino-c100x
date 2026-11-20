@@ -14,12 +14,53 @@ from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .api import ApiError, LegrandApi, log_api_failure
 from .auth import AuthenticationError, C100XAuth, log_auth_failure
-from .const import CONF_GATEWAY_ID, CONF_HOME_ID, CONF_LOCK_IDS, DOMAIN
+from .const import (
+    CONF_GATEWAY_ID,
+    CONF_HOME_ID,
+    CONF_LOCK_IDS,
+    CONF_TURN_API_TOKEN,
+    CONF_TURN_KEY_ID,
+    DOMAIN,
+)
 from .topology import button_id, open_address, visible_lock_modules
 
 # Only B2C logon status!=200 is mapped to invalid_auth. Other AuthenticationError
 # reason codes are setup/service failures and must not read as wrong password.
 _CREDENTIAL_REJECTED = "credentials_rejected"
+
+
+def _turn_schema(*, key_id: str = "") -> vol.Schema:
+    """Optional Cloudflare TURN fields; token uses a password selector."""
+    return vol.Schema(
+        {
+            vol.Optional(CONF_TURN_KEY_ID, default=key_id): str,
+            vol.Optional(CONF_TURN_API_TOKEN): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+            ),
+        }
+    )
+
+
+def _normalized_turn_options(
+    user_input: dict[str, Any],
+    *,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, str] | None:
+    """Return TURN options, keep previous token if the password field is blank.
+
+    Returns ``None`` when the key ID is empty (clears TURN from options).
+    Raises ``ValueError`` when a key ID is set but no token is available.
+    """
+    previous = previous or {}
+    key_id = str(user_input.get(CONF_TURN_KEY_ID) or "").strip()
+    token = str(user_input.get(CONF_TURN_API_TOKEN) or "").strip()
+    if not key_id:
+        return None
+    if not token:
+        token = str(previous.get(CONF_TURN_API_TOKEN) or "").strip()
+    if not token:
+        raise ValueError("incomplete_turn")
+    return {CONF_TURN_KEY_ID: key_id, CONF_TURN_API_TOKEN: token}
 
 
 class C100XConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -33,6 +74,11 @@ class C100XConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._credentials: dict[str, str] = {}
         self._plants: list[dict] = []
+        self._home_id: str | None = None
+        self._gateway_id: str | None = None
+        self._lock_choices: dict[str, str] = {}
+        self._lock_ids: list[str] = []
+        self._title: str = "BTicino C100X"
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> config_entries.ConfigFlowResult:
         schema = vol.Schema({vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str})
@@ -149,14 +195,33 @@ class C100XConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors={"base": "select_lock"},
             )
         plant = next(plant for plant in self._plants if plant["id"] == self._home_id)
+        self._lock_ids = selected
+        self._title = plant.get("name", "BTicino C100X")
+        return await self.async_step_turn()
+
+    async def async_step_turn(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Optional Cloudflare TURN for remote (CGNAT/cellular) WebRTC."""
+        if user_input is None:
+            return self.async_show_form(step_id="turn", data_schema=_turn_schema())
+        try:
+            turn_options = _normalized_turn_options(user_input)
+        except ValueError:
+            return self.async_show_form(
+                step_id="turn",
+                data_schema=_turn_schema(key_id=str(user_input.get(CONF_TURN_KEY_ID) or "")),
+                errors={"base": "incomplete_turn"},
+            )
         return self.async_create_entry(
-            title=plant.get("name", "BTicino C100X"),
+            title=self._title,
             data={
                 **self._credentials,
                 CONF_HOME_ID: self._home_id,
                 CONF_GATEWAY_ID: self._gateway_id,
-                CONF_LOCK_IDS: selected,
+                CONF_LOCK_IDS: self._lock_ids,
             },
+            options=turn_options or {},
         )
 
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> config_entries.ConfigFlowResult:
@@ -198,9 +263,25 @@ class C100XConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class C100XOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         if user_input is not None:
-            if not user_input[CONF_LOCK_IDS]:
-                return self.async_show_form(step_id="init", data_schema=self._schema(), errors={"base": "select_lock"})
-            return self.async_create_entry(data={CONF_LOCK_IDS: user_input[CONF_LOCK_IDS]})
+            if not user_input.get(CONF_LOCK_IDS):
+                return self.async_show_form(
+                    step_id="init", data_schema=self._schema(), errors={"base": "select_lock"}
+                )
+            try:
+                turn_options = _normalized_turn_options(
+                    user_input, previous=dict(self.config_entry.options)
+                )
+            except ValueError:
+                return self.async_show_form(
+                    step_id="init",
+                    data_schema=self._schema(),
+                    errors={"base": "incomplete_turn"},
+                )
+            data: dict[str, Any] = {CONF_LOCK_IDS: user_input[CONF_LOCK_IDS]}
+            if turn_options:
+                data.update(turn_options)
+            return self.async_create_entry(data=data)
+
         session = async_create_clientsession(self.hass, auto_cleanup=False, cookie_jar=aiohttp.CookieJar())
         try:
             auth = C100XAuth(session, self.config_entry.data[CONF_USERNAME], self.config_entry.data[CONF_PASSWORD])
@@ -213,8 +294,19 @@ class C100XOptionsFlow(config_entries.OptionsFlow):
         return self.async_show_form(step_id="init", data_schema=self._schema())
 
     def _schema(self):
-        current = self.config_entry.options.get(CONF_LOCK_IDS, self.config_entry.data[CONF_LOCK_IDS])
-        return vol.Schema({vol.Required(CONF_LOCK_IDS, default=current): _lock_selector(self._choices)})
+        current_locks = self.config_entry.options.get(
+            CONF_LOCK_IDS, self.config_entry.data[CONF_LOCK_IDS]
+        )
+        current_key = str(self.config_entry.options.get(CONF_TURN_KEY_ID) or "")
+        return vol.Schema(
+            {
+                vol.Required(CONF_LOCK_IDS, default=current_locks): _lock_selector(self._choices),
+                vol.Optional(CONF_TURN_KEY_ID, default=current_key): str,
+                vol.Optional(CONF_TURN_API_TOKEN): selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+                ),
+            }
+        )
 
 
 def _home_choices(plants: list[dict]) -> dict[str, str]:

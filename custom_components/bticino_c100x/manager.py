@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from homeassistant.components.web_rtc import async_get_ice_servers
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
@@ -304,7 +305,10 @@ class C100XManager:
             self._material_dir / "playback.sdp",
             self._material_dir / "snapshot.jpg",
         )
-        self.microphone_uplink = MicrophoneUplink(self.media_session)
+        self.microphone_uplink = MicrophoneUplink(
+            self.media_session,
+            ice_servers=lambda: async_get_ice_servers(self.hass),
+        )
         self.registered = True
         self.last_error = None
         self._notify()

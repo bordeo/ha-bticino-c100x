@@ -83,10 +83,10 @@ def test_rtc_configuration_adds_relay_for_aiortc() -> None:
     sys.modules[spec.name] = webrtc
     spec.loader.exec_module(webrtc)
 
-    plain = webrtc._rtc_configuration()
+    plain = webrtc.rtc_configuration()
     assert [s.urls for s in plain.iceServers] == [cfg.SERVER_STUN_URL]
     turn = SimpleNamespace(urls=["turn:turn.cloudflare.com:3478?transport=udp"], username="u", credential="c")
-    relayed = webrtc._rtc_configuration([turn])
+    relayed = webrtc.rtc_configuration([turn])
     assert relayed.iceServers[1].username == "u"
     assert relayed.iceServers[1].urls[0].startswith("turn:")
 
@@ -97,6 +97,24 @@ def test_rtc_configuration_adds_relay_for_aiortc() -> None:
     assert kwargs["turn_server"] == ("turn.cloudflare.com", 3478)
     assert kwargs["turn_username"] == "u"
     assert kwargs["turn_transport"] == "udp"
+
+
+def test_microphone_uplink_uses_rtc_configuration_with_turn() -> None:
+    """Mic uplink must gather TURN like the video peer (CGNAT + cellular)."""
+    from custom_components.bticino_c100x.uplink import MicrophoneUplink
+
+    turn = SimpleNamespace(
+        urls=["turn:turn.cloudflare.com:3478?transport=udp"],
+        username="u",
+        credential="c",
+    )
+    uplink = MicrophoneUplink(session=SimpleNamespace(), ice_servers=lambda: [turn])
+    from custom_components.bticino_c100x.webrtc import rtc_configuration
+
+    config = rtc_configuration(uplink._ice_servers())
+    assert len(config.iceServers) == 2
+    assert config.iceServers[1].username == "u"
+    assert "turn:" in config.iceServers[1].urls[0]
 
 
 def test_read_turn_file_missing_returns_none(tmp_path: Path) -> None:
@@ -134,15 +152,41 @@ def test_read_turn_file_malformed_raises(tmp_path: Path, body: str) -> None:
         turn_mod._read_turn_file(path)
 
 
-def _hass_with_config_path(config_dir: Path) -> MagicMock:
+def _hass_with_config_path(
+    config_dir: Path, *, entries: list | None = None
+) -> MagicMock:
     hass = MagicMock()
     hass.config.path = lambda *parts: str(config_dir.joinpath(*parts))
+    hass.config_entries.async_entries = MagicMock(return_value=list(entries or []))
 
     async def _executor(func, *args):
         return func(*args)
 
     hass.async_add_executor_job = _executor
     return hass
+
+
+@pytest.mark.asyncio
+async def test_resolve_prefers_options_over_yaml_and_file(tmp_path: Path) -> None:
+    (tmp_path / "bticino_turn.yaml").write_text(
+        'cloudflare_turn_key_id: "file-kid"\ncloudflare_turn_api_token: "file-tok"\n',
+        encoding="utf-8",
+    )
+    entry = SimpleNamespace(
+        options={
+            "cloudflare_turn_key_id": "opt-kid",
+            "cloudflare_turn_api_token": "opt-tok",
+        }
+    )
+    hass = _hass_with_config_path(tmp_path, entries=[entry])
+    resolved = await turn_mod._async_resolve_turn_credentials(
+        hass,
+        {
+            "cloudflare_turn_key_id": "yaml-kid",
+            "cloudflare_turn_api_token": "yaml-tok",
+        },
+    )
+    assert resolved == ("opt-kid", "opt-tok")
 
 
 @pytest.mark.asyncio
@@ -197,3 +241,22 @@ async def test_resolve_malformed_file_warns_without_values(
     assert resolved is None
     assert "malformed" in caplog.text
     assert "secret-kid" not in caplog.text
+
+
+def test_normalized_turn_options_keeps_blank_token() -> None:
+    from custom_components.bticino_c100x.config_flow import _normalized_turn_options
+
+    assert _normalized_turn_options(
+        {"cloudflare_turn_key_id": "kid", "cloudflare_turn_api_token": ""},
+        previous={"cloudflare_turn_key_id": "old", "cloudflare_turn_api_token": "kept"},
+    ) == {"cloudflare_turn_key_id": "kid", "cloudflare_turn_api_token": "kept"}
+    assert _normalized_turn_options({"cloudflare_turn_key_id": "", "cloudflare_turn_api_token": "x"}) is None
+    with pytest.raises(ValueError):
+        _normalized_turn_options({"cloudflare_turn_key_id": "kid", "cloudflare_turn_api_token": ""})
+
+
+def test_diagnostics_redacts_turn_token() -> None:
+    from custom_components.bticino_c100x.diagnostics import REDACT
+
+    assert "cloudflare_turn_api_token" in REDACT
+    assert "cloudflare_turn_key_id" in REDACT

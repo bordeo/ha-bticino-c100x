@@ -32,9 +32,18 @@ function microphoneErrorText(error) {
   if (name === "NotAllowedError" || name === "SecurityError") return "Permesso microfono negato";
   if (name === "NotFoundError" || name === "OverconstrainedError") return "Nessun microfono trovato";
   if (name === "NotReadableError" || name === "AbortError") return "Microfono occupato";
-  if (error?.code === "microphone_failed") return "Microfono non disponibile";
+  // Negotiate / ICE / server uplink failures (after getUserMedia succeeded).
+  if (error?.code === "microphone_failed" || error?.code === "microphone_ice_failed") {
+    return "Microfono: connessione non riuscita";
+  }
   return "Errore microfono";
 }
+
+const FALLBACK_ICE_SERVERS = [
+  { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:stun.cloudflare.com:53" },
+  { urls: "stun:stun.linphone.org:3478" },
+];
 
 class BticinoC100XCard extends HTMLElement {
   setConfig(config) {
@@ -509,32 +518,51 @@ class BticinoC100XCard extends HTMLElement {
     this.updateControls();
   }
 
+  async microphoneIceServers() {
+    // Prefer HA's camera WebRTC client config (STUN + registered Cloudflare TURN).
+    try {
+      const config = await this._hass.connection.sendMessagePromise({
+        type: "camera/webrtc/get_client_config",
+        entity_id: this.config.camera_entity,
+      });
+      const servers = config?.configuration?.iceServers;
+      if (Array.isArray(servers) && servers.length) return servers;
+    } catch (error) {
+      // Fall through to STUN-only defaults (LAN / no TURN configured).
+    }
+    return FALLBACK_ICE_SERVERS;
+  }
+
   async enableMicrophone() {
+    // Mic tap is a user gesture: also unmute door audio if autoplay muted it.
+    this.unmute();
     // Permission is intentionally requested only from this explicit click.
     const media = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    // Same STUN set as webrtc_config.STUN_URLS so the uplink can gather srflx.
-    const peer = new RTCPeerConnection({
-      iceServers: [
-        { urls: "stun:stun.cloudflare.com:3478" },
-        { urls: "stun:stun.cloudflare.com:53" },
-        { urls: "stun:stun.linphone.org:3478" },
-      ],
-    });
+    const iceServers = await this.microphoneIceServers();
+    const peer = new RTCPeerConnection({ iceServers });
     try {
       media.getAudioTracks().forEach((track) => peer.addTrack(track, media));
       await peer.setLocalDescription(await peer.createOffer());
       await new Promise((resolve) => {
         if (peer.iceGatheringState === "complete") return resolve();
-        // Cap the wait: an unreachable STUN server must not leave the button spinning.
+        // Cap the wait: an unreachable STUN/TURN server must not leave the button spinning.
         setTimeout(resolve, ICE_GATHER_TIMEOUT_MS);
         peer.addEventListener("icegatheringstatechange", () =>
           peer.iceGatheringState === "complete" && resolve());
       });
-      const result = await this._hass.connection.sendMessagePromise({
-        type: "bticino_c100x/microphone/negotiate", entry_id: this.entryId,
-        owner: this.owner, offer: peer.localDescription.sdp
-      });
-      await peer.setRemoteDescription({ type: "answer", sdp: result.answer });
+      let result;
+      try {
+        result = await this._hass.connection.sendMessagePromise({
+          type: "bticino_c100x/microphone/negotiate", entry_id: this.entryId,
+          owner: this.owner, offer: peer.localDescription.sdp
+        });
+        await peer.setRemoteDescription({ type: "answer", sdp: result.answer });
+      } catch (error) {
+        if (error && typeof error === "object" && !error.name) {
+          error.code = error.code || "microphone_ice_failed";
+        }
+        throw error;
+      }
       if (this.phase !== "live") {
         // Session ended while negotiating: close the uplink again.
         this.peer = peer; this.microphoneMedia = media;

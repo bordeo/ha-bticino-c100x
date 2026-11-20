@@ -14,6 +14,8 @@ PLATFORMS = [
 CONF_HOME_ID = "home_id"
 CONF_GATEWAY_ID = "gateway_id"
 CONF_LOCK_IDS = "lock_ids"
+CONF_TURN_KEY_ID = "cloudflare_turn_key_id"
+CONF_TURN_API_TOKEN = "cloudflare_turn_api_token"
 
 API_BASE = "https://api.developer.legrand.com"
 API_SUBSCRIPTION_KEY = "f36968e522bf4ec3877fa491109d3d14"

@@ -45,6 +45,21 @@ const SETUP = ({ scenario }) => {
     connection: { sendMessagePromise: async (msg) => {
       window.wsCalls.push(msg.type + (msg.enabled === false ? ":false" : ""));
       if (window.WS_FAIL) throw { code: "microphone_failed", message: "RuntimeError" };
+      if (msg.type === "camera/webrtc/get_client_config") {
+        return {
+          configuration: {
+            iceServers: [
+              { urls: "stun:stun.cloudflare.com:3478" },
+              { urls: "stun:stun.linphone.org:3478" },
+              {
+                urls: ["turn:turn.cloudflare.com:3478?transport=udp"],
+                username: "u",
+                credential: "c",
+              },
+            ],
+          },
+        };
+      }
       if (msg.type === "bticino_c100x/microphone/negotiate") {
         const pc = new RTCPeerConnection();
         await pc.setRemoteDescription({ type: "offer", sdp: msg.offer });
@@ -143,7 +158,10 @@ async function run(name, opts, body) {
     ok("mic on: no status", i.status === "", i.status);
     await shot("05-mic-on-light.png");
     const iceServers = await page.evaluate(() => card.peer.getConfiguration().iceServers.map((s) => s.urls));
-    ok("mic: STUN servers intact", JSON.stringify(iceServers).includes("stun.cloudflare.com:3478") && JSON.stringify(iceServers).includes("stun.linphone.org"), JSON.stringify(iceServers));
+    const iceJson = JSON.stringify(iceServers);
+    ok("mic: STUN servers intact", iceJson.includes("stun.cloudflare.com:3478") && iceJson.includes("stun.linphone.org"), iceJson);
+    ok("mic: TURN from get_client_config", iceJson.includes("turn:turn.cloudflare.com:3478"), iceJson);
+    ok("mic: fetched camera ice config", i.ws.includes("camera/webrtc/get_client_config"), JSON.stringify(i.ws));
     // End
     await page.evaluate(() => card.shadowRoot.querySelector(".session").click());
     await page.waitForFunction(() => card.phase === "idle", null, { timeout: 5000 });
@@ -209,7 +227,22 @@ async function run(name, opts, body) {
     await page.evaluate(() => card.shadowRoot.querySelector(".mic").click());
     await page.waitForFunction(() => card.shadowRoot.querySelector(".status").textContent, null, { timeout: 20000 });
     const i = await info(page);
-    ok("mic ws fail: readable error", i.status === "Microfono non disponibile", i.status);
+    ok("mic ws fail: connection error text", i.status === "Microfono: connessione non riuscita", i.status);
+  });
+
+  await run("mic-unmutes-playback", { ios: true }, async (page) => {
+    // Autoplay muted fallback, then mic tap (user gesture) must unmute door audio.
+    await page.evaluate(() => { window.__noGesture = true; card.shadowRoot.querySelector(".session").click(); });
+    await page.waitForFunction(() => card.phase === "live" && card.videoReady, null, { timeout: 15000 });
+    await page.waitForTimeout(1200);
+    await page.evaluate(() => { window.__noGesture = false; });
+    let i = await info(page);
+    ok("mic-unmute: starts muted", i.video.muted === true && i.unmuteHidden === false, JSON.stringify([i.video, i.unmuteHidden]));
+    await page.locator("bticino-c100x-card button.mic").click();
+    await page.waitForFunction(() => !!card.peer, null, { timeout: 20000 });
+    await page.waitForTimeout(300);
+    i = await info(page);
+    ok("mic-unmute: mic on and door audio unmuted", i.mic.icon === "mdi:microphone" && i.video.muted === false && i.unmuteHidden === true, JSON.stringify(i));
   });
 
   await run("autoplay-ios", { ios: true }, async (page, shot) => {
