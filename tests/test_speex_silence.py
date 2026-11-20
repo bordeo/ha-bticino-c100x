@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -77,8 +78,18 @@ async def test_speex_send_silence_uses_canned_frame() -> None:
     await protocol.send_silence()
     assert sent == [SPEEX_8000_SILENCE_FRAME, SPEEX_8000_SILENCE_FRAME]
 
-    # With a ready encoder stub, unmuted silence is suppressed for real mic frames.
-    protocol._speex = object()  # type: ignore[assignment]
+    # With a live encoder stub, unmuted silence is suppressed for real mic frames.
+    protocol._speex = SimpleNamespace(alive=True)  # type: ignore[assignment]
     assert protocol.talkback_encoder_ready is True
     await protocol.send_silence()
     assert sent == [SPEEX_8000_SILENCE_FRAME, SPEEX_8000_SILENCE_FRAME]
+
+    # Dead encoder must resume silence so unmute cannot kill listen.
+    protocol._speex = SimpleNamespace(alive=False)  # type: ignore[assignment]
+    assert protocol.talkback_encoder_ready is False
+    await protocol.send_silence()
+    assert sent == [
+        SPEEX_8000_SILENCE_FRAME,
+        SPEEX_8000_SILENCE_FRAME,
+        SPEEX_8000_SILENCE_FRAME,
+    ]

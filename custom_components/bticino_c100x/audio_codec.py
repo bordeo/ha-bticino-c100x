@@ -138,6 +138,14 @@ class SpeexFfmpegEncoder:
         self._local_port = 0
         self._lock = asyncio.Lock()
         self._silence_payload: bytes | None = None
+        self._dead = False
+
+    @property
+    def alive(self) -> bool:
+        """False after close, pipe failure, or ffmpeg exit."""
+        if self._dead or self._process is None:
+            return False
+        return self._process.returncode is None
 
     async def start(self) -> None:
         # Probe off the event loop — ``ffmpeg -encoders`` can take hundreds of ms.
@@ -199,6 +207,9 @@ class SpeexFfmpegEncoder:
             raise
         if silence:
             self._silence_payload = silence
+        elif not self.alive:
+            await self.close()
+            raise RuntimeError("Speex ffmpeg encoder exited during silence warm-up")
         else:
             _LOGGER.warning(
                 "Speex ffmpeg encoder started but silence warm-up timed out; "
@@ -222,14 +233,19 @@ class SpeexFfmpegEncoder:
                 self._silence_payload = payload
             return payload
 
+    def _mark_dead(self) -> None:
+        """Stop treating this encoder as usable; process cleanup happens in close()."""
+        self._dead = True
+
     async def _encode_unlocked(self, pcm_s16le: bytes, *, timeout: float) -> bytes | None:
-        if not self._process or not self._process.stdin or not self._protocol:
+        if not self.alive or not self._process or not self._process.stdin or not self._protocol:
             return None
         generation = self._protocol.clear()
         try:
             self._process.stdin.write(pcm_s16le)
             await self._process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, OSError):
+            self._mark_dead()
             return None
         return await self._protocol.wait_payload(timeout=timeout, generation=generation)
 
@@ -237,6 +253,7 @@ class SpeexFfmpegEncoder:
         # Serialize against in-flight encode/drain so teardown cannot tear stdin
         # out from under a concurrent ``_encode_unlocked``.
         async with self._lock:
+            self._dead = True
             process, self._process = self._process, None
             self._silence_payload = None
             if process and process.stdin:

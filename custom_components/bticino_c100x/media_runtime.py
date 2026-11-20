@@ -258,7 +258,7 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         if name == "opus":
             return self._opus is not None
         if name == "speex":
-            return self._speex is not None
+            return self._speex is not None and self._speex.alive
         return False
 
     def prime_remote(self) -> None:
