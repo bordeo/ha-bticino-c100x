@@ -221,7 +221,8 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         path = resolve_ffmpeg(ffmpeg_path)
         if not path:
             _LOGGER.error(
-                "Speex negotiated but ffmpeg was not found; talkback/silence uplink disabled"
+                "Speex negotiated but ffmpeg was not found; "
+                "mic talkback disabled (canned silence keepalive still runs)"
             )
             self._speex_pending = False
             return
@@ -239,12 +240,26 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
                 await encoder.close()
             _LOGGER.error(
                 "Speex negotiated but ffmpeg libspeex encoder failed (%s); "
-                "talkback/silence uplink disabled",
+                "mic talkback disabled (canned silence keepalive still runs)",
                 err,
             )
             self._speex_pending = False
             return
         self._speex_pending = False
+
+    @property
+    def talkback_encoder_ready(self) -> bool:
+        """True when unmuted mic frames can be encoded for the negotiated codec."""
+        if self._codec is None:
+            return False
+        name = self._codec.name.casefold()
+        if name in {"pcma", "pcmu"}:
+            return self._encoder is not None
+        if name == "opus":
+            return self._opus is not None
+        if name == "speex":
+            return self._speex is not None
+        return False
 
     def prime_remote(self) -> None:
         """Open a symmetric-NAT path with a STUN Binding Request, not a dummy byte."""
@@ -328,6 +343,9 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
                     continue
                 self._send_payload(payload, samples=self._opus.frame_samples)
             elif name == "speex":
+                if self._speex is None:
+                    # Encoder missing: keepalive continues silence; skip mic PCM.
+                    continue
                 prev = self._speex_chain
                 epoch = self._speex_epoch
 
@@ -346,8 +364,16 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
                 self._speex_chain = asyncio.create_task(_run())
 
     async def send_silence(self) -> None:
-        """Send one 20 ms silence frame without enabling the microphone."""
-        if self._microphone_enabled or self._codec is None or self._fmt is None:
+        """Send one 20 ms silence frame to keep the door's downlink open.
+
+        When the microphone is unmuted *and* a talkback encoder is ready, real
+        mic frames replace silence. If Speex/Opus encoding is unavailable,
+        keep sending silence even while the mic is "enabled" so listen does not
+        die when the user unmutes.
+        """
+        if self._codec is None or self._fmt is None:
+            return
+        if self._microphone_enabled and self.talkback_encoder_ready:
             return
         name = self._codec.name.casefold()
         try:
@@ -361,7 +387,7 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
                 payload = speex_silence_frame(self._codec.clock_rate or 8000)
                 if payload is None and self._speex is not None:
                     payload = await self._speex.encode_silence()
-                if payload and not self._microphone_enabled:
+                if payload:
                     self._send_payload(payload, samples=samples)
         except (ValueError, pylibsrtp.Error, av.FFmpegError, OSError):
             return
@@ -417,6 +443,7 @@ class AudioRtpProtocol(asyncio.DatagramProtocol):
         self._timestamp = (self._timestamp + samples) & 0xFFFFFFFF
 
     async def aclose_encoders(self) -> None:
+        # Bump epoch first so in-flight chain tasks exit without another encode.
         self._speex_epoch += 1
         chain, self._speex_chain = self._speex_chain, None
         if chain is not None:
@@ -753,13 +780,17 @@ class MediaRuntime:
             raise
 
     async def _audio_keepalive(self) -> None:
-        """Send view-only Speex/G.711 silence so the door opens downlink, like Door Entry."""
+        """Send Speex/G.711 silence so the door opens downlink, like Door Entry.
+
+        Continues while the mic is muted, and also while unmuted if talkback
+        encoding is unavailable (so listen is not killed by a failed Speex
+        encoder). ``send_silence`` itself skips when real mic frames can flow.
+        """
         try:
             while not self._ending:
                 session = self.negotiated
                 if (
-                    not self.microphone_enabled
-                    and self.audio
+                    self.audio
                     and session
                     and session.audio
                     and session.audio.direction in {"sendrecv", "recvonly"}

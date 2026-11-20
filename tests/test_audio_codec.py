@@ -50,3 +50,20 @@ def test_opus_encoder_silence_and_pcm() -> None:
     pcm = b"\x00\x01" * enc.frame_samples
     packet = enc.encode(pcm)
     assert isinstance(packet, bytes) and len(packet) > 0
+
+
+@pytest.mark.asyncio
+async def test_rtp_collector_ignores_stale_generation() -> None:
+    from custom_components.bticino_c100x.audio_codec import _RtpCollector
+
+    collector = _RtpCollector()
+    gen1 = collector.clear()
+    collector.datagram_received(b"\x80\x00" + b"\x00" * 10 + b"old", ("127.0.0.1", 1))
+    gen2 = collector.clear()
+    assert gen2 != gen1
+    # Late packet for gen1 must not satisfy gen2's wait.
+    collector.datagram_received(b"\x80\x00" + b"\x00" * 10 + b"stale", ("127.0.0.1", 1))
+    assert await collector.wait_payload(timeout=0.01, generation=gen1) is None
+    # Fresh packet for gen2.
+    collector.datagram_received(b"\x80\x00" + b"\x00" * 10 + b"fresh", ("127.0.0.1", 1))
+    assert await collector.wait_payload(timeout=0.05, generation=gen2) == b"fresh"

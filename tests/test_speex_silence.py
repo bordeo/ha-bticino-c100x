@@ -71,7 +71,14 @@ async def test_speex_send_silence_uses_canned_frame() -> None:
     await protocol.send_silence()
     assert sent == [SPEEX_8000_SILENCE_FRAME]
 
-    # Mic unmute suppresses silence keepalive frames.
+    # Without a Speex encoder, unmute must NOT stop silence (listen would die).
+    assert protocol.talkback_encoder_ready is False
     protocol.set_microphone(True)
     await protocol.send_silence()
-    assert sent == [SPEEX_8000_SILENCE_FRAME]
+    assert sent == [SPEEX_8000_SILENCE_FRAME, SPEEX_8000_SILENCE_FRAME]
+
+    # With a ready encoder stub, unmuted silence is suppressed for real mic frames.
+    protocol._speex = object()  # type: ignore[assignment]
+    assert protocol.talkback_encoder_ready is True
+    await protocol.send_silence()
+    assert sent == [SPEEX_8000_SILENCE_FRAME, SPEEX_8000_SILENCE_FRAME]

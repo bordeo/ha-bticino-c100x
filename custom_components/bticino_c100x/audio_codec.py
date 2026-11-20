@@ -140,7 +140,11 @@ class SpeexFfmpegEncoder:
         self._silence_payload: bytes | None = None
 
     async def start(self) -> None:
-        if not ffmpeg_has_encoder(self.ffmpeg_path, "libspeex"):
+        # Probe off the event loop — ``ffmpeg -encoders`` can take hundreds of ms.
+        has_libspeex = await asyncio.to_thread(
+            ffmpeg_has_encoder, self.ffmpeg_path, "libspeex"
+        )
+        if not has_libspeex:
             raise RuntimeError("ffmpeg libspeex encoder is not available")
         loop = asyncio.get_running_loop()
         self._protocol = _RtpCollector()
@@ -221,35 +225,53 @@ class SpeexFfmpegEncoder:
     async def _encode_unlocked(self, pcm_s16le: bytes, *, timeout: float) -> bytes | None:
         if not self._process or not self._process.stdin or not self._protocol:
             return None
-        self._protocol.clear()
-        self._process.stdin.write(pcm_s16le)
-        await self._process.stdin.drain()
-        return await self._protocol.wait_payload(timeout=timeout)
+        generation = self._protocol.clear()
+        try:
+            self._process.stdin.write(pcm_s16le)
+            await self._process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return None
+        return await self._protocol.wait_payload(timeout=timeout, generation=generation)
 
     async def close(self) -> None:
-        process, self._process = self._process, None
-        self._silence_payload = None
-        if process and process.stdin:
-            with contextlib.suppress(Exception):
-                process.stdin.close()
-        if process and process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.terminate()
-            with contextlib.suppress(TimeoutError, ProcessLookupError):
-                await asyncio.wait_for(process.wait(), timeout=1)
-        if self._transport:
-            self._transport.close()
-            self._transport = None
+        # Serialize against in-flight encode/drain so teardown cannot tear stdin
+        # out from under a concurrent ``_encode_unlocked``.
+        async with self._lock:
+            process, self._process = self._process, None
+            self._silence_payload = None
+            if process and process.stdin:
+                with contextlib.suppress(Exception):
+                    process.stdin.close()
+            if process and process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.terminate()
+                with contextlib.suppress(TimeoutError, ProcessLookupError):
+                    await asyncio.wait_for(process.wait(), timeout=1)
+                if process.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    with contextlib.suppress(TimeoutError, ProcessLookupError):
+                        await asyncio.wait_for(process.wait(), timeout=1)
+            if process and process.stderr:
+                with contextlib.suppress(Exception):
+                    await process.stderr.read()
+            if self._transport:
+                self._transport.close()
+                self._transport = None
 
 
 class _RtpCollector(asyncio.DatagramProtocol):
     def __init__(self) -> None:
         self._payload: bytes | None = None
         self._event = asyncio.Event()
+        self._generation = 0
 
-    def clear(self) -> None:
+    def clear(self) -> int:
+        """Start a new wait generation; ignore late packets from prior encodes."""
+        self._generation += 1
         self._payload = None
         self._event = asyncio.Event()
+        return self._generation
 
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
         if len(data) < 12:
@@ -257,7 +279,9 @@ class _RtpCollector(asyncio.DatagramProtocol):
         self._payload = data[12:]
         self._event.set()
 
-    async def wait_payload(self, *, timeout: float) -> bytes | None:
+    async def wait_payload(self, *, timeout: float, generation: int) -> bytes | None:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        if generation != self._generation:
+            return None
         return self._payload
