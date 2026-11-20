@@ -21,7 +21,7 @@ from aiortc import (
 from aiortc.contrib.media import MediaPlayer, MediaRelay
 from aiortc.sdp import candidate_from_sdp
 
-from .webrtc_config import SERVER_STUN_URL
+from .webrtc_config import SERVER_STUN_URL, aiortc_turn_entry
 
 _LOGGER = logging.getLogger(__name__)
 PLAYER_GRACE_SECONDS = 10
@@ -63,9 +63,16 @@ class WebRTCBridge:
     """Share one bounded local media channel between WebRTC viewers."""
 
     def __init__(
-        self, media_path: Path, viewer_changed, audio_track=None, snapshot_path: Path | None = None
+        self,
+        media_path: Path,
+        viewer_changed,
+        audio_track=None,
+        snapshot_path: Path | None = None,
+        ice_servers=None,
     ) -> None:
         self.media_path = media_path
+        # Callable returning Home Assistant's registered ICE servers (may hold TURN).
+        self.ice_servers = ice_servers
         self.viewer_changed = viewer_changed
         self.audio_track = audio_track
         self.snapshot_path = snapshot_path
@@ -91,7 +98,9 @@ class WebRTCBridge:
                 self._cleanup_task.cancel()
                 self._cleanup_task = None
             await self._ensure_player(media_generation)
-            peer = RTCPeerConnection(_rtc_configuration())
+            peer = RTCPeerConnection(
+                _rtc_configuration(self.ice_servers() if self.ice_servers else None)
+            )
             self._peers[session_id] = peer
             self.viewer_changed(1)
 
@@ -304,12 +313,23 @@ def _candidate_summary(sdp: str) -> str:
     return f"media={','.join(media) or 'none'} candidates={','.join(types) or 'none'}"
 
 
-def _rtc_configuration() -> RTCConfiguration:
-    """Use one NAT mapping for video, received audio and future microphone media."""
-    return RTCConfiguration(
-        iceServers=[RTCIceServer(urls=SERVER_STUN_URL)],
-        bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
-    )
+def _rtc_configuration(ice_servers=None) -> RTCConfiguration:
+    """Use one NAT mapping for video, received audio and future microphone media.
+
+    When Home Assistant has a credentialed TURN server registered, also gather
+    a relay candidate so a CGNAT home and a cellular phone can still connect.
+    """
+    servers = [RTCIceServer(urls=SERVER_STUN_URL)]
+    turn = aiortc_turn_entry(ice_servers)
+    if turn:
+        servers.append(
+            RTCIceServer(
+                urls=turn["urls"],
+                username=turn["username"],
+                credential=turn["credential"],
+            )
+        )
+    return RTCConfiguration(iceServers=servers, bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
 
 
 def _candidate_route(host: str) -> str:

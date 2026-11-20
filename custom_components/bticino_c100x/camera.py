@@ -9,6 +9,7 @@ from homeassistant.components.camera.webrtc import (
     WebRTCClientConfiguration,
     WebRTCSendMessage,
 )
+from homeassistant.components.web_rtc import async_get_ice_servers
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
@@ -42,6 +43,7 @@ class C100XCamera(C100XEntity, Camera):
             if self.manager.media_session
             else None,
             Path(self.manager._material_dir, "snapshot.jpg"),
+            ice_servers=lambda: async_get_ice_servers(self.hass),
         )
 
     async def async_camera_image(self, width=None, height=None) -> bytes | None:

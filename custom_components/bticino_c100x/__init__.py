@@ -22,6 +22,7 @@ from .const import DOMAIN, PLATFORMS, STORAGE_VERSION
 from .manager import C100XManager
 from .media_runtime import MediaRuntimeError
 from .sip import SipError
+from .turn import async_setup_turn
 from .websocket import async_register as async_register_websocket
 
 CARD_PATH = Path(__file__).parent / "frontend" / "bticino-c100x-card.js"
@@ -41,6 +42,8 @@ CARD_URL = CARD_STATIC_URL
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register private APIs and the card asset once."""
     async_register_websocket(hass)
+    # Optional YAML: bticino_c100x: {cloudflare_turn_key_id, cloudflare_turn_api_token}
+    await async_setup_turn(hass, config.get(DOMAIN) or {})
     if hass.http:
         await hass.http.async_register_static_paths(
             [StaticPathConfig(CARD_STATIC_URL, str(CARD_PATH), cache_headers=False)]
