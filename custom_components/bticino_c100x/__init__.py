@@ -20,21 +20,27 @@ from homeassistant.helpers.storage import Store
 
 from .api import ApiError, LegrandApi
 from .auth import AuthenticationError, C100XAuth
-from .const import DOMAIN, PLATFORMS, STORAGE_VERSION
+from .const import (
+    CONF_TURN_API_TOKEN,
+    CONF_TURN_KEY_ID,
+    DOMAIN,
+    PLATFORMS,
+    STORAGE_VERSION,
+)
 from .manager import C100XManager
 from .media_runtime import MediaRuntimeError
 from .sip import SipError
-from .turn import async_setup_turn
+from .turn import async_setup_turn, async_update_turn
 from .websocket import async_register as async_register_websocket
 
 # Devices come from config entries; YAML may carry optional TURN keys
-# (alternatively: config/bticino_turn.yaml — see turn.py).
+# (alternatively: integration options or config/bticino_turn.yaml — see turn.py).
 CONFIG_SCHEMA = vol.Schema(
     {
         vol.Optional(DOMAIN): vol.Schema(
             {
-                vol.Inclusive("cloudflare_turn_key_id", "cloudflare_turn"): cv.string,
-                vol.Inclusive("cloudflare_turn_api_token", "cloudflare_turn"): cv.string,
+                vol.Inclusive(CONF_TURN_KEY_ID, "cloudflare_turn"): cv.string,
+                vol.Inclusive(CONF_TURN_API_TOKEN, "cloudflare_turn"): cv.string,
             }
         )
     },
@@ -43,12 +49,13 @@ CONFIG_SCHEMA = vol.Schema(
 
 CARD_PATH = Path(__file__).parent / "frontend" / "bticino-c100x-card.js"
 CARD_STATIC_URL = "/bticino_c100x/bticino-c100x-card.js"
+# Digest at import time so Lovelace registration never blocks the event loop.
+_CARD_DIGEST = hashlib.sha256(CARD_PATH.read_bytes()).hexdigest()[:16]
 
 
 def card_module_url() -> str:
     """Lovelace module URL with content hash so SPA tabs fetch a new document."""
-    digest = hashlib.sha256(CARD_PATH.read_bytes()).hexdigest()[:16]
-    return f"{CARD_STATIC_URL}?v={digest}"
+    return f"{CARD_STATIC_URL}?v={_CARD_DIGEST}"
 
 
 # Back-compat alias for tests/docs that import CARD_URL.
@@ -58,7 +65,7 @@ CARD_URL = CARD_STATIC_URL
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register private APIs and the card asset once."""
     async_register_websocket(hass)
-    # Optional TURN: bticino_c100x YAML block, else config/bticino_turn.yaml.
+    # Optional TURN: options > YAML block > config/bticino_turn.yaml.
     await async_setup_turn(hass, config.get(DOMAIN) or {})
     if hass.http:
         await hass.http.async_register_static_paths(
@@ -77,6 +84,8 @@ type C100XConfigEntry = ConfigEntry[RuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: C100XConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # Options may have changed (or arrived after domain setup): refresh TURN.
+    await async_update_turn(hass)
     session = async_create_clientsession(hass, cookie_jar=aiohttp.CookieJar())
     token_store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.tokens.{entry.entry_id}")
 

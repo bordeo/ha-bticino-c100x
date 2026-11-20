@@ -1,0 +1,64 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connetti a BTicino Door Entry",
+        "description": "Inserisci le credenziali dell'app ufficiale Door Entry.",
+        "data": {"username": "Email", "password": "Password"}
+      },
+      "home": {"title": "Seleziona installazione", "data": {"home_id": "Installazione"}},
+      "locks": {
+        "title": "Seleziona aperture porta",
+        "description": "Seleziona ogni serratura fisica ancora collegata a questa installazione.",
+        "data": {"lock_ids": "Aperture porta"}
+      },
+      "turn": {
+        "title": "TURN Cloudflare (opzionale)",
+        "description": "Per vedere il citofono da rete mobile (CGNAT), aggiungi una chiave Cloudflare Realtime TURN. Lascia vuoto per saltare — puoi configurarla dopo nelle opzioni dell'integrazione. Il token API viene mostrato una sola volta nella dashboard Cloudflare.",
+        "data": {
+          "cloudflare_turn_key_id": "ID chiave TURN Cloudflare",
+          "cloudflare_turn_api_token": "Token API TURN Cloudflare"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Riconnetti BTicino Door Entry",
+        "description": "Inserisci la password attuale dell'account Door Entry.",
+        "data": {"password": "Password"}
+      }
+    },
+    "error": {
+      "cannot_connect": "Impossibile raggiungere l'autenticazione Door Entry (non necessariamente password errata). Controlla il log di Home Assistant per reason_code BTicino.",
+      "invalid_auth": "Credenziali non valide",
+      "select_lock": "Seleziona almeno un'apertura porta collegata",
+      "incomplete_turn": "Inserisci sia ID chiave TURN sia token API, oppure lascia entrambi vuoti",
+      "installation_data_invalid": "Impossibile caricare i moduli di quell'installazione (HTTP {http_status}, {reason_code}, body {body_kind}). Scegline un'altra — le credenziali restano; controlla il log HA per l'errore API BTicino.",
+      "unsupported_installation": "Nessun gateway e serratura compatibili su quell'installazione. Scegline un'altra dall'elenco (senza nuovo login)."
+    },
+    "abort": {
+      "already_configured": "Questo account è già configurato",
+      "cannot_connect": "Impossibile caricare l'installazione",
+      "installation_data_invalid": "Impossibile caricare i moduli dell'installazione (HTTP {http_status}, {reason_code}, body {body_kind}). Controlla il log di Home Assistant per l'errore API BTicino.",
+      "no_homes": "Nessuna installazione Door Entry trovata",
+      "reauth_successful": "Autenticazione aggiornata",
+      "unsupported_installation": "Nessun gateway e serratura compatibili trovati"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opzioni BTicino C100X",
+        "description": "Aggiorna le aperture porta e il TURN Cloudflare opzionale per la visione remota. Lascia vuoto il token API TURN per mantenere quello attuale.",
+        "data": {
+          "lock_ids": "Aperture porta",
+          "cloudflare_turn_key_id": "ID chiave TURN Cloudflare",
+          "cloudflare_turn_api_token": "Token API TURN Cloudflare"
+        }
+      }
+    },
+    "error": {
+      "select_lock": "Seleziona almeno un'apertura porta collegata",
+      "incomplete_turn": "Inserisci sia ID chiave TURN sia token API, oppure svuota entrambi per rimuovere TURN dalle opzioni"
+    },
+    "abort": {"cannot_connect": "Impossibile caricare le aperture porta da Legrand"}
+  }
+}

@@ -12,6 +12,14 @@
         "description": "Select every physical lock that is still connected to this installation.",
         "data": {"lock_ids": "Door releases"}
       },
+      "turn": {
+        "title": "Optional Cloudflare TURN",
+        "description": "For viewing from mobile data (CGNAT), add a Cloudflare Realtime TURN key. Leave blank to skip — you can set this later in the integration options. The API token is shown only once in the Cloudflare dashboard.",
+        "data": {
+          "cloudflare_turn_key_id": "Cloudflare TURN key ID",
+          "cloudflare_turn_api_token": "Cloudflare TURN API token"
+        }
+      },
       "reauth_confirm": {
         "title": "Reconnect BTicino Door Entry",
         "description": "Enter the current Door Entry account password.",
@@ -22,6 +30,7 @@
       "cannot_connect": "Cannot reach Door Entry authentication (not necessarily wrong password). Check the Home Assistant log for BTicino auth failure reason_code.",
       "invalid_auth": "Invalid credentials",
       "select_lock": "Select at least one connected door release",
+      "incomplete_turn": "Enter both TURN key ID and API token, or leave both empty",
       "installation_data_invalid": "Cannot load modules for that installation (HTTP {http_status}, {reason_code}, body {body_kind}). Pick another installation — credentials stay; check the HA log for BTicino API failure.",
       "unsupported_installation": "No compatible gateway and door lock on that installation. Pick another from the list (no re-login)."
     },
@@ -33,5 +42,23 @@
       "reauth_successful": "Authentication was updated",
       "unsupported_installation": "No compatible gateway and door lock were found"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "BTicino C100X options",
+        "description": "Update door releases and optional Cloudflare TURN for remote viewing. Leave the TURN API token blank to keep the current token.",
+        "data": {
+          "lock_ids": "Door releases",
+          "cloudflare_turn_key_id": "Cloudflare TURN key ID",
+          "cloudflare_turn_api_token": "Cloudflare TURN API token"
+        }
+      }
+    },
+    "error": {
+      "select_lock": "Select at least one connected door release",
+      "incomplete_turn": "Enter both TURN key ID and API token, or clear both to remove TURN from options"
+    },
+    "abort": {"cannot_connect": "Cannot load door releases from Legrand"}
   }
 }

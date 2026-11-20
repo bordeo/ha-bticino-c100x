@@ -313,8 +313,8 @@ def _candidate_summary(sdp: str) -> str:
     return f"media={','.join(media) or 'none'} candidates={','.join(types) or 'none'}"
 
 
-def _rtc_configuration(ice_servers=None) -> RTCConfiguration:
-    """Use one NAT mapping for video, received audio and future microphone media.
+def rtc_configuration(ice_servers=None) -> RTCConfiguration:
+    """STUN (+ optional TURN) for video and microphone uplink peers.
 
     When Home Assistant has a credentialed TURN server registered, also gather
     a relay candidate so a CGNAT home and a cellular phone can still connect.
@@ -330,6 +330,10 @@ def _rtc_configuration(ice_servers=None) -> RTCConfiguration:
             )
         )
     return RTCConfiguration(iceServers=servers, bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
+
+
+# Back-compat for tests/imports that used the private name.
+_rtc_configuration = rtc_configuration
 
 
 def _candidate_route(host: str) -> str:

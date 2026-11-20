@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.6 — 2026-11-20
+
+- Microphone uplink now uses the same ICE servers as the video peer (HA `camera/webrtc/get_client_config`, including Cloudflare TURN). The aiortc mic peer also gathers TURN relay candidates. Fixes mic/ICE failure from cellular CGNAT when video already worked via TURN.
+- Mic button also unmutes door playback (iOS/WKWebView autoplay often leaves the video muted); clearer status text for negotiate/ICE failures (`Microfono: connessione non riuscita`).
+- Card JS content-hash digest is computed at import time (no blocking `read_bytes` on the event loop).
+- Cloudflare TURN via **integration options** (and optional config-flow step): key ID + API token (password selector). Precedence: options → YAML block → `bticino_turn.yaml`. Options reload refreshes ICE. Token redacted in diagnostics. README remote-access guide + en/it strings.
+
 ## 0.3.5 — 2026-11-20
 
 - TURN credentials fallback: if `configuration.yaml` has no `bticino_c100x:` TURN keys, load `bticino_turn.yaml` from the HA config directory (`cloudflare_turn_key_id` / `cloudflare_turn_api_token`). Missing file → same as no TURN. Malformed file → warning (no values logged) and continue without TURN. YAML block still takes precedence. Debug log when credentials are loaded from the file.
