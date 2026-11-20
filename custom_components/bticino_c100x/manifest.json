@@ -3,7 +3,7 @@
   "name": "BTicino C100X",
   "codeowners": ["@bordeo"],
   "config_flow": true,
-  "dependencies": ["ffmpeg", "http", "lovelace"],
+  "dependencies": ["ffmpeg", "http", "lovelace", "web_rtc"],
   "documentation": "https://github.com/bordeo/ha-bticino-c100x",
   "integration_type": "device",
   "iot_class": "cloud_push",
