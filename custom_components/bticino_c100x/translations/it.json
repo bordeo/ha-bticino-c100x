@@ -47,9 +47,10 @@
     "step": {
       "init": {
         "title": "Opzioni BTicino C100X",
-        "description": "Aggiorna le aperture porta e il TURN Cloudflare opzionale per la visione remota. Lascia vuoto il token API TURN per mantenere quello attuale.",
+        "description": "Aggiorna le aperture porta, il guadagno audio in ascolto e il TURN Cloudflare opzionale per la visione remota. Lascia vuoto il token API TURN per mantenere quello attuale.",
         "data": {
           "lock_ids": "Aperture porta",
+          "audio_gain_db": "Guadagno audio porta (dB)",
           "cloudflare_turn_key_id": "ID chiave TURN Cloudflare",
           "cloudflare_turn_api_token": "Token API TURN Cloudflare"
         }

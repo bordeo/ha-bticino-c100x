@@ -49,12 +49,24 @@ CONFIG_SCHEMA = vol.Schema(
 
 CARD_PATH = Path(__file__).parent / "frontend" / "bticino-c100x-card.js"
 CARD_STATIC_URL = "/bticino_c100x/bticino-c100x-card.js"
-# Digest at import time so Lovelace registration never blocks the event loop.
-_CARD_DIGEST = hashlib.sha256(CARD_PATH.read_bytes()).hexdigest()[:16]
+_CARD_DIGEST: str | None = None
+
+
+def _compute_card_digest() -> str:
+    return hashlib.sha256(CARD_PATH.read_bytes()).hexdigest()[:16]
 
 
 def card_module_url() -> str:
     """Lovelace module URL with content hash so SPA tabs fetch a new document."""
+    digest = _CARD_DIGEST if _CARD_DIGEST is not None else _compute_card_digest()
+    return f"{CARD_STATIC_URL}?v={digest}"
+
+
+async def async_card_module_url(hass: HomeAssistant) -> str:
+    """Compute the card digest off the event loop, then return the hashed URL."""
+    global _CARD_DIGEST
+    if _CARD_DIGEST is None:
+        _CARD_DIGEST = await hass.async_add_executor_job(_compute_card_digest)
     return f"{CARD_STATIC_URL}?v={_CARD_DIGEST}"
 
 
@@ -121,7 +133,7 @@ async def _async_register_card_resource(hass: HomeAssistant) -> None:
         return
     resources = lovelace.resources
     await resources.async_get_info()
-    desired = card_module_url()
+    desired = await async_card_module_url(hass)
     for item in resources.async_items():
         url = str(item.get("url") or "")
         if not url.startswith(CARD_STATIC_URL):

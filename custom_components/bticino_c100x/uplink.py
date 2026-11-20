@@ -99,7 +99,9 @@ class MicrophoneUplink:
         self._track_ready.clear()
 
     async def _forward(self, track: Any) -> None:
-        resampler = AudioResampler(format="s16", layout="mono", rate=8000)
+        # Match the negotiated uplink codec clock (Speex/G.711 8 kHz, Opus 48 kHz).
+        rate = self.session.runtime.talkback_sample_rate
+        resampler = AudioResampler(format="s16", layout="mono", rate=rate)
         while True:
             frame = await track.recv()
             for converted in resampler.resample(frame):

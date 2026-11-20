@@ -50,9 +50,10 @@
     "step": {
       "init": {
         "title": "BTicino C100X options",
-        "description": "Update door releases and optional Cloudflare TURN for remote viewing. Leave the TURN API token blank to keep the current token.",
+        "description": "Update door releases, door-listen gain, and optional Cloudflare TURN for remote viewing. Leave the TURN API token blank to keep the current token.",
         "data": {
           "lock_ids": "Door releases",
+          "audio_gain_db": "Door audio gain (dB)",
           "cloudflare_turn_key_id": "Cloudflare TURN key ID",
           "cloudflare_turn_api_token": "Cloudflare TURN API token"
         }
