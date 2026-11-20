@@ -1,0 +1,4 @@
+libspeex.so binaries are from Speex 1.2.1 (Xiph.org), BSD-3-Clause.
+Alpine Linux packages: speex-1.2.1-r2 (musl x86_64 / aarch64).
+Debian packages: libspeex1 1.2.1-2 (glibc amd64 / arm64).
+https://www.speex.org/ https://gitlab.xiph.org/xiph/speex
