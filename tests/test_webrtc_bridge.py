@@ -72,6 +72,8 @@ async def test_wait_for_player_frame_sets_on_keepalive(tmp_path: Path) -> None:
 
 
 def test_rtc_configuration_skips_stun_when_turn_present() -> None:
+    from aiortc import RTCIceTransportPolicy
+
     turn = MagicMock()
     turn.urls = ["turn:example.example:3478?transport=udp"]
     turn.username = "u"
@@ -79,12 +81,22 @@ def test_rtc_configuration_skips_stun_when_turn_present() -> None:
     config = rtc_configuration([turn])
     assert len(config.iceServers) == 1
     assert str(config.iceServers[0].urls[0]).startswith("turn:")
+    # Host candidates must still be gathered (never iceTransportPolicy=relay).
+    assert config.iceTransportPolicy == RTCIceTransportPolicy.ALL
 
 
-def test_rtc_configuration_uses_stun_without_turn() -> None:
+def test_rtc_configuration_no_turn_keeps_lan_stun_and_host_policy() -> None:
+    """Alex's rule: TURN is optional; LAN must work with no TURN key."""
+    from aiortc import RTCIceTransportPolicy
+    from aiortc.rtcicetransport import connection_kwargs
+
     config = rtc_configuration(None)
     assert len(config.iceServers) == 1
     assert config.iceServers[0].urls == SERVER_STUN_URL
+    assert config.iceTransportPolicy == RTCIceTransportPolicy.ALL
+    kwargs = connection_kwargs(config.iceServers)
+    assert kwargs.get("stun_server") == ("stun.linphone.org", 3478)
+    assert "turn_server" not in kwargs
 
 
 def test_card_ice_gather_timeout_is_short() -> None:

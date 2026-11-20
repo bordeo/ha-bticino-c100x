@@ -15,6 +15,7 @@ from aiortc import (
     RTCBundlePolicy,
     RTCConfiguration,
     RTCIceServer,
+    RTCIceTransportPolicy,
     RTCPeerConnection,
     RTCSessionDescription,
 )
@@ -394,10 +395,13 @@ def _candidate_summary(sdp: str) -> str:
 
 
 def rtc_configuration(ice_servers=None) -> RTCConfiguration:
-    """Host ICE always; add TURN when configured, otherwise one STUN.
+    """Build ICE config: always gather host; TURN is optional.
 
-    Skip STUN when TURN is present: aioice STUN retries are a common ~5s stall
-    on CGNAT, while host + TURN is enough for LAN and remote relay.
+    - No TURN key → STUN only (LAN / same-network viewing still works).
+    - TURN configured → TURN in ``iceServers`` and **skip STUN** so aioice is
+      not stalled ~5s by blocked STUN on CGNAT. This is **host + TURN**, never
+      relay-only: ``iceTransportPolicy`` stays ``all`` so local host candidates
+      are always gathered for the home LAN.
     """
     turn = aiortc_turn_entry(ice_servers)
     if turn:
@@ -410,7 +414,11 @@ def rtc_configuration(ice_servers=None) -> RTCConfiguration:
         ]
     else:
         servers = [RTCIceServer(urls=SERVER_STUN_URL)]
-    return RTCConfiguration(iceServers=servers, bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
+    return RTCConfiguration(
+        iceServers=servers,
+        iceTransportPolicy=RTCIceTransportPolicy.ALL,
+        bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
+    )
 
 
 # Back-compat for tests/imports that used the private name.
